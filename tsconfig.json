@@ -1,0 +1,43 @@
+{
+  "compilerOptions": {
+    /* ── Language & Environment ──────────────────────────────────────────── */
+    "target": "ES2022",
+    "lib": ["ES2022", "ES2023.Array", "ESNext.Disposable"],
+    "module": "node16",
+    "moduleResolution": "node16",
+
+    /* ── Type Checking (all strict flags + extras) ───────────────────────── */
+    "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+
+    /* ── Emit ────────────────────────────────────────────────────────────── */
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./dist/esm",
+    "rootDir": "./src",
+
+    /* ── Interop ─────────────────────────────────────────────────────────── */
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": false,
+
+    /* ── Library compatibility ───────────────────────────────────────────── */
+    // Skip type-checking of .d.ts files inside node_modules.  Several
+    // dependencies (@msgpack/msgpack, @exhumer/undici-cookie-agent) have
+    // declaration files that reference DOM globals (BufferSource) or use
+    // EventEmitter as a global without importing it - bugs in their own
+    // typings that we cannot fix.  skipLibCheck suppresses those errors
+    // while still fully type-checking our source files.
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

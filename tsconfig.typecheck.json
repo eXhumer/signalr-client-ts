@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    /* ── Module path overrides ────────────────────────────────────────────── */
+    // tough-cookie v6 ships separate ESM (.d.ts) and CJS (.d.cts) type
+    // declarations.  With moduleResolution:node16, TypeScript resolves the ESM
+    // declaration (.d.ts) for our source files and the CJS declaration (.d.cts)
+    // for CJS-context packages such as @exhumer/undici-cookie-agent.  The two
+    // declarations have incompatible private fields (the dual-package hazard),
+    // causing a structural type error when our CookieJar is passed to
+    // CookieAgent.  Pinning to the CTS declaration file makes both contexts
+    // resolve the same declaration, eliminating the conflict.
+    //
+    // This override lives here rather than in tsconfig.json so that tsup's
+    // esbuild JS bundler, which reads tsconfig.json for module resolution,
+    // never sees the redirect (esbuild would follow it to the .d.cts file and
+    // try to bundle it as JS).  The equivalent override for tsup's DTS worker
+    // is declared in tsup.config.ts under dts.compilerOptions.paths.
+    "paths": {
+      "tough-cookie": ["./node_modules/tough-cookie/dist/index.d.cts"]
+    }
+  }
+}
