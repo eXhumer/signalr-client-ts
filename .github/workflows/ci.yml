@@ -34,7 +34,9 @@ jobs:
         run: npm run coverage
 
       - name: Upload coverage to Codecov
-        if: matrix.node-version == 22 && secrets.CODECOV_TOKEN != ''
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        if: matrix.node-version == 22 && env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

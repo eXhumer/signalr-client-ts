@@ -52,7 +52,7 @@ describe('PipelineHttpClient.stream - else branch of !resolved (line 586)', () =
     // The mock captures the handler without calling it, and returns fakeDuplex
     // so that the production code can attach listeners and call end().
     mockPipeline.mockImplementation((_url, _opts, handler) => {
-      capturedHandler = handler as PipelineHandler;
+      capturedHandler = handler as unknown as PipelineHandler;
       return fakeDuplex as unknown as ReturnType<typeof pipelineMock>;
     });
 

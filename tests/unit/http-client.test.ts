@@ -444,7 +444,7 @@ describe('DispatchHttpClient.stream - else branch of !resolved (L763)', () => {
 
     // ── First call: resolved = false → TRUE branch ────────────────────────
     // Sets resolved = true and resolves the Promise.
-    (capturedHandler as DispatchHandler).onResponseStart!(fakeCtrl, 200, {});
+    capturedHandler!.onResponseStart!(fakeCtrl, 200, {});
 
     const result = await streamPromise;
     expect(result.statusCode).toBe(200);
@@ -452,7 +452,7 @@ describe('DispatchHttpClient.stream - else branch of !resolved (L763)', () => {
     // ── Second call: resolved = true → FALSE branch (else) ────────────────
     // The `if (!resolved)` guard is now false; the block is skipped silently.
     expect(() => {
-      (capturedHandler as DispatchHandler).onResponseStart!(fakeCtrl, 200, {});
+      capturedHandler!.onResponseStart!(fakeCtrl, 200, {});
     }).not.toThrow();
   });
 });

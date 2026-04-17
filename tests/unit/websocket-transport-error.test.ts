@@ -209,7 +209,7 @@ describe('WebSocketTransport.connect - connect-time error branches (lines 128-14
   // e.error is not Error, e.message is absent → 'WebSocket error' default.
 
   it('rejects with "WebSocket error" default when e.error and e.message are both absent (L138 ?? branch)', async () => {
-    setConnectError({ error: undefined, message: undefined });
+    setConnectError({ error: undefined });
 
     const rejection = await new WebSocketTransport(null, new MockLogger())
       .connect('ws://fake-host', TransferFormat.Text)
@@ -254,7 +254,7 @@ describe('WebSocketTransport - post-open error listener branches (lines 183-200)
 
   it('post-open error with no e.message falls back to "WebSocket error" (L190 ?? Branch #2)', async () => {
     setPostOpenError({
-      event:     { error: undefined, message: undefined },
+      event:     { error: undefined },
       readyState: 1,
     });
 
