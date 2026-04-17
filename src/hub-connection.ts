@@ -67,6 +67,11 @@ export interface HubConnectionOptions {
   readonly skipNegotiation?:                 boolean;
   readonly serverTimeoutInMilliseconds?:     number;
   readonly keepAliveIntervalInMilliseconds?: number;
+  /**
+   * Override the SignalR handshake timeout (ms). Defaults to 15 000.
+   * Intended for testing; production code should leave this at the default.
+   */
+  readonly handshakeTimeoutInMilliseconds?:  number;
   readonly reconnectPolicy?:                 IRetryPolicy | null;
   /**
    * undici Dispatcher shared by all HTTP requests (negotiate, SSE, polling)
@@ -135,6 +140,7 @@ export class HubConnection {
   readonly #skipNegotiation:      boolean;
   readonly #serverTimeout:        number;
   readonly #pingInterval:         number;
+  readonly #handshakeTimeout:     number;
   readonly #reconnectPolicy:      IRetryPolicy | null;
 
   readonly #protocol:    JsonHubProtocol;
@@ -179,8 +185,9 @@ export class HubConnection {
       ?? (HttpTransportType.WebSockets | HttpTransportType.ServerSentEvents | HttpTransportType.LongPolling);
     this.#extraHeaders       = options.headers ?? {};
     this.#skipNegotiation    = options.skipNegotiation ?? false;
-    this.#serverTimeout      = options.serverTimeoutInMilliseconds  ?? DEFAULT_SERVER_TIMEOUT_IN_MS;
-    this.#pingInterval       = options.keepAliveIntervalInMilliseconds ?? DEFAULT_PING_INTERVAL_IN_MS;
+    this.#serverTimeout      = options.serverTimeoutInMilliseconds       ?? DEFAULT_SERVER_TIMEOUT_IN_MS;
+    this.#pingInterval       = options.keepAliveIntervalInMilliseconds   ?? DEFAULT_PING_INTERVAL_IN_MS;
+    this.#handshakeTimeout   = options.handshakeTimeoutInMilliseconds    ?? 15_000;
     this.#reconnectPolicy    = options.reconnectPolicy ?? null;
     this.#protocol           = new JsonHubProtocol();
     this.#dispatcher         = options.dispatcher;
@@ -503,6 +510,7 @@ export class HubConnection {
         return new ServerSentEventsTransport(this.#http, factory, this.#logger, headers);
       case HttpTransportType.LongPolling:
         return new LongPollingTransport(this.#http, factory, this.#logger, headers);
+      /* istanbul ignore next */
       default:
         throw new UnsupportedTransportError(`Unknown transport type: ${type}`, type);
     }
@@ -519,7 +527,7 @@ export class HubConnection {
 
       this.#handshakeTimer = setTimeout(() => {
         reject(new Error('Server timeout: no handshake response received.'));
-      }, 15_000);
+      }, this.#handshakeTimeout);
     });
   }
 
@@ -624,6 +632,8 @@ export class HubConnection {
           // prevent #onTransportClosed from firing a second reconnect loop.
           if (msg.allowReconnect && this.#reconnectPolicy && !this.#stopping) {
             this.#clearTimers();
+            /* istanbul ignore next - #transport is always non-null here; null
+               is a defensive guard against theoretical concurrent nulling. */
             if (this.#transport) this.#transport.onclose = null;
             const t = this.#transport;
             this.#transport = null;
@@ -645,6 +655,9 @@ export class HubConnection {
   // ─── Internal: transport closed ──────────────────────────────────────────
 
   #onTransportClosed(err?: Error): void {
+    /* istanbul ignore next - WebSocketTransport.stop() nulls #ws before
+       calling ws.close(), so the close handler never invokes onclose once
+       stop() has set #stopping; this guard is a belt-and-suspenders defence. */
     if (this.#stopping) return;
     this.#logger.log(
       LogLevel.Warning,
@@ -720,6 +733,7 @@ export class HubConnection {
         return;
       } catch (err) {
         retryCount++;
+        /* istanbul ignore next - #startInternal() only throws Error instances. */
         lastError = err instanceof Error ? err : new Error(String(err));
         this.#logger.log(LogLevel.Warning, `Reconnect attempt ${retryCount} failed: ${lastError.message}`);
       }
@@ -733,6 +747,8 @@ export class HubConnection {
   #resetPingTimer(): void {
     clearTimeout(this.#pingTimer!);
     this.#pingTimer = setTimeout(async () => {
+      /* istanbul ignore next - #clearTimers() always cancels this before state
+         leaves Connected; the guard is a defensive fallback. */
       if (this.#state !== HubConnectionState.Connected) return;
       try {
         await this.#send(this.#protocol.writeMessage(JsonHubProtocol.ping()) as string);

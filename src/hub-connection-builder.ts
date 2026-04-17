@@ -49,6 +49,8 @@ export interface UrlOptions {
   readonly serverTimeoutInMilliseconds?: number;
   /** ms between keep-alive pings (default: 15 000). */
   readonly keepAliveIntervalInMilliseconds?: number;
+  /** ms to wait for the SignalR handshake response (default: 15 000). */
+  readonly handshakeTimeoutInMilliseconds?: number;
 }
 
 // ─── HubConnectionBuilder ────────────────────────────────────────────────────
@@ -288,6 +290,7 @@ export class HubConnectionBuilder {
       ...(this.#urlOptions.skipNegotiation          != null && { skipNegotiation:                 this.#urlOptions.skipNegotiation }),
       ...(this.#urlOptions.serverTimeoutInMilliseconds     != null && { serverTimeoutInMilliseconds:     this.#urlOptions.serverTimeoutInMilliseconds }),
       ...(this.#urlOptions.keepAliveIntervalInMilliseconds != null && { keepAliveIntervalInMilliseconds: this.#urlOptions.keepAliveIntervalInMilliseconds }),
+      ...(this.#urlOptions.handshakeTimeoutInMilliseconds  != null && { handshakeTimeoutInMilliseconds:  this.#urlOptions.handshakeTimeoutInMilliseconds }),
       ...(this.#reconnectPolicy    != null && { reconnectPolicy: this.#reconnectPolicy }),
       ...(effectiveDispatcher      != null && { dispatcher:      effectiveDispatcher  }),
       ...(this.#httpClient         != null && { httpClient:      this.#httpClient     }),

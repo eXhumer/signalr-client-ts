@@ -22,9 +22,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
+
+      # nodejs/node#62425 & npm/cli#9151
+      - run: npm install -g npm@11.11.0
 
       # Ensure npm 11.5.1 or later for trusted publishing
       - run: npm install -g npm@latest

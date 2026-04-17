@@ -23,6 +23,32 @@ export default defineConfig({
      * moment, so give it the same headroom as individual tests.
      */
     hookTimeout: 30_000,
+
+    coverage: {
+      /**
+       * Use Istanbul for coverage instrumentation.  Istanbul instruments source
+       * code directly, giving accurate branch and statement coverage that maps
+       * cleanly onto TypeScript source rather than compiled JS output.
+       */
+      provider: 'istanbul',
+
+      /**
+       * Only instrument source files, not tests, helpers, or generated output.
+       */
+      include: ['src/**/*.ts'],
+      exclude: ['src/**/*.d.ts'],
+
+      /**
+       * Reporters: human-readable summary in the terminal + lcov for CI / IDE
+       * integrations (e.g. Coverage Gutters in VS Code).
+       */
+      reporter: ['text', 'lcov'],
+
+      /**
+       * Write all coverage artefacts to coverage/.
+       */
+      reportsDirectory: 'coverage',
+    },
   },
 
   benchmark: {

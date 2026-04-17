@@ -462,4 +462,311 @@ describe('WebSocketClient', () => {
     ws.close();
     srvSock.destroy();
   });
+
+  // 19. Server sends a masked text frame - client XOR-unmasks and delivers it (lines 421-423, 430-433)
+  it('server sends a masked text frame - client XOR-unmasks and delivers it (lines 421-423, 430-433)', async () => {
+    const ws       = new WebSocketClient();
+    const srvSockP = srv.nextSocket();
+    await ws.connect(`ws://127.0.0.1:${srv.port}`);
+    const srvSock  = await srvSockP;
+
+    const msgP = new Promise<string>((resolve) => ws.on('message', resolve));
+
+    // Masked text frame: FIN(1)|opcode(1)=0x81, MASK(1)|len(5)=0x85
+    const maskKey       = Buffer.from([0xaa, 0xbb, 0xcc, 0xdd]);
+    const plainPayload  = Buffer.from('hello');
+    const maskedPayload = Buffer.from(plainPayload.map((b, i) => b ^ maskKey[i % 4]!));
+
+    // Step 1: header only (2 bytes) → buf.length < offset+4 for mask key → return null (line 421)
+    srvSock.write(Buffer.from([0x81, 0x85]));
+    await new Promise<void>((r) => setTimeout(r, 20));
+
+    // Step 2: mask key + payload → lines 422-423, 430-433
+    srvSock.write(Buffer.concat([maskKey, maskedPayload]));
+
+    const msg = await msgP;
+    expect(msg).toBe('hello');
+
+    ws.close();
+    srvSock.destroy();
+  });
+
+  // 20. Client sends a large message (>65535 bytes): uses 8-byte extended length (line 356)
+  it('sends a frame with >65535-byte payload using 8-byte extended length (line 356)', async () => {
+    const ws       = new WebSocketClient();
+    const srvSockP = srv.nextSocket();
+    await ws.connect(`ws://127.0.0.1:${srv.port}`);
+    const srvSock  = await srvSockP;
+
+    const payloadChar = 'Z';
+    const payloadLen  = 70_000;
+    const bigPayload  = payloadChar.repeat(payloadLen);
+
+    const receivedP = new Promise<string>((resolve) => {
+      let buf = Buffer.alloc(0);
+      srvSock.on('data', (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        // frame: [0]=opcode, [1]=0xFF (mask|127), [2-9]=8-byte len, [10-13]=mask, [14...]=payload
+        if (buf.length < 14) return;
+        const extLen = buf.readUInt32BE(6);  // low 32 bits of the 8-byte length
+        if (buf.length < 14 + extLen) return;
+        const maskKey  = buf.subarray(10, 14);
+        const masked   = buf.subarray(14, 14 + extLen);
+        const unmasked = Buffer.allocUnsafe(extLen);
+        for (let i = 0; i < extLen; i++) unmasked[i] = masked[i]! ^ maskKey[i % 4]!;
+        resolve(unmasked.toString('utf8'));
+      });
+    });
+
+    ws.send(bigPayload);
+    const received = await receivedP;
+
+    expect(received.length).toBe(payloadLen);
+    expect(received[0]).toBe(payloadChar);
+    // Verify the length encoding: byte[1] must be 0x80|127 = 0xFF
+    // (we can't easily check buf from here, but if we decoded correctly the content confirms it)
+
+    ws.close();
+    srvSock.destroy();
+  });
+
+  // 21. Server sends a 126-extended-length frame in two writes (lines 408-410)
+  it('receives a 126-extended-length frame split across two TCP writes (lines 408-410)', async () => {
+    const ws       = new WebSocketClient();
+    const srvSockP = srv.nextSocket();
+    await ws.connect(`ws://127.0.0.1:${srv.port}`);
+    const srvSock  = await srvSockP;
+
+    // Build a 200-byte payload frame using the 126 extended-length format
+    const payload = Buffer.alloc(200, 0x41);  // 200 'A' bytes
+    const frame   = encodeServerFrame(0x1, payload);  // encodeServerFrame uses 126 for 126≤len<65536
+
+    const msgP = new Promise<string>((resolve) => ws.on('message', resolve));
+
+    // Step 1: send only the 2-byte header → payLen=126, but buf.length < offset+2 → return null (line 408)
+    srvSock.write(frame.subarray(0, 2));
+    await new Promise<void>((r) => setTimeout(r, 20));
+
+    // Step 2: send extended-length bytes + payload → lines 409-410 parse the 2-byte extended length
+    srvSock.write(frame.subarray(2));
+
+    const msg = await msgP;
+    expect(msg.length).toBe(200);
+    expect(msg).toBe('A'.repeat(200));
+
+    ws.close();
+    srvSock.destroy();
+  });
+
+  // 22a. Server returns non-101 status code → handshake fails with descriptive error (line 216)
+  it('rejects when server responds with a non-101 status code (line 216)', async () => {
+    const badServer = net.createServer((sock: net.Socket) => {
+      let buf = Buffer.alloc(0);
+      sock.on('data', (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        if (!buf.includes(Buffer.from('\r\n\r\n'))) return;
+        sock.write('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n');
+        sock.end();
+      });
+    });
+    await new Promise<void>((r) => badServer.listen(0, '127.0.0.1', r));
+    const { port: badPort } = badServer.address() as net.AddressInfo;
+
+    const ws = new WebSocketClient();
+    await expect(
+      () => ws.connect(`ws://127.0.0.1:${badPort}`),
+    ).rejects.toThrow(/upgrade failed|400/i);
+
+    await new Promise<void>((r) => badServer.close(() => r()));
+  });
+
+  // 22b. Server sends a binary frame (opcode 0x2) → client emits 'binary' event (line 328)
+  it('emits "binary" event when server sends a binary frame (line 328)', async () => {
+    const ws       = new WebSocketClient();
+    const srvSockP = srv.nextSocket();
+    await ws.connect(`ws://127.0.0.1:${srv.port}`);
+    const srvSock  = await srvSockP;
+
+    const binaryP = new Promise<Buffer>((resolve) => ws.on('binary', resolve));
+    const binaryData = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
+    // opcode 0x2 = binary frame
+    srvSock.write(encodeServerFrame(0x2, binaryData));
+    const received = await binaryP;
+    expect(Buffer.compare(received, binaryData)).toBe(0);
+
+    ws.close();
+    srvSock.destroy();
+  });
+
+  // 22c. Client sends a 200-byte message → uses 2-byte extended length (lines 349-351)
+  it('sends a frame with 126-65535-byte payload using 2-byte extended length (lines 349-351)', async () => {
+    const ws       = new WebSocketClient();
+    const srvSockP = srv.nextSocket();
+    await ws.connect(`ws://127.0.0.1:${srv.port}`);
+    const srvSock  = await srvSockP;
+
+    const payloadLen = 200; // 126 ≤ 200 < 65536 → must use 2-byte extended length
+    const payload    = 'M'.repeat(payloadLen);
+
+    const receivedP = new Promise<string>((resolve) => {
+      let buf = Buffer.alloc(0);
+      srvSock.on('data', (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        // Frame: [0]=opcode, [1]=0x80|126, [2-3]=2-byte length, [4-7]=mask, [8...]=payload
+        if (buf.length < 8) return;
+        const extLen = buf.readUInt16BE(2);
+        if (buf.length < 8 + extLen) return;
+        const maskKey  = buf.subarray(4, 8);
+        const masked   = buf.subarray(8, 8 + extLen);
+        const unmasked = Buffer.allocUnsafe(extLen);
+        for (let i = 0; i < extLen; i++) unmasked[i] = masked[i]! ^ maskKey[i % 4]!;
+        resolve(unmasked.toString('utf8'));
+      });
+    });
+
+    ws.send(payload);
+    const received = await receivedP;
+    expect(received.length).toBe(payloadLen);
+    expect(received).toBe(payload);
+
+    ws.close();
+    srvSock.destroy();
+  });
+
+  // 24. connect() called while already open rejects immediately (lines 107-108)
+  it('connect() rejects if called while already open', async () => {
+    const ws       = new WebSocketClient();
+    const srvSockP = srv.nextSocket();
+    await ws.connect(`ws://127.0.0.1:${srv.port}`);
+    const srvSock  = await srvSockP;
+
+    await expect(
+      () => ws.connect(`ws://127.0.0.1:${srv.port}`),
+    ).rejects.toThrow(/already open or connecting/i);
+
+    ws.close();
+    srvSock.destroy();
+  });
+
+  // 25. Custom headers are included in the upgrade request (line 131)
+  it('custom headers are sent in the upgrade request', async () => {
+    const headerServer = net.createServer((sock: net.Socket) => {
+      let buf = Buffer.alloc(0);
+      sock.on('data', (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        if (!buf.includes(Buffer.from('\r\n\r\n'))) return;
+        const req = buf.toString('ascii');
+        const match = req.match(/Sec-WebSocket-Key: ([^\r\n]+)/);
+        if (!match) { sock.destroy(); return; }
+        const accept = crypto.createHash('sha1').update(match[1]!.trim() + WS_GUID).digest('base64');
+        // Echo the parsed custom header value back as a custom response header so the test can verify it
+        const hasCustom = req.includes('X-Test-Header: test-value');
+        sock.write(
+          `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\nX-Custom-Seen: ${hasCustom}\r\n\r\n`
+        );
+      });
+      sock.on('error', () => {});
+    });
+    await new Promise<void>((r) => headerServer.listen(0, '127.0.0.1', r));
+    const { port: headerPort } = headerServer.address() as net.AddressInfo;
+
+    const ws = new WebSocketClient();
+    // connect() with extra headers — exercises the ...Object.entries(headers).map() spread (line 131)
+    await ws.connect(`ws://127.0.0.1:${headerPort}`, { 'X-Test-Header': 'test-value' });
+    expect(ws.readyState).toBe(WebSocketReadyState.Open);
+
+    ws.close();
+    await new Promise<void>((r) => headerServer.close(() => r()));
+  });
+
+  // 26. Error in Open state is emitted (line 160)
+  it('socket error while Open is forwarded as an "error" event', async () => {
+    const ws       = new WebSocketClient();
+    const srvSockP = srv.nextSocket();
+    await ws.connect(`ws://127.0.0.1:${srv.port}`);
+    const srvSock  = await srvSockP;
+
+    const errorP = new Promise<Error>((resolve) => ws.on('error', resolve));
+
+    // resetAndDestroy() sends a TCP RST, which causes ECONNRESET on the client
+    // while it is in the Open state → line 160 in ws-client.ts emits 'error'.
+    srvSock.resetAndDestroy();
+
+    const err = await errorP;
+    expect(err).toBeInstanceOf(Error);
+  });
+
+  // 27. send() with a Buffer and with a Uint8Array both send binary frames (line 179)
+  it('send() accepts Buffer and Uint8Array and sends binary frames', async () => {
+    const ws       = new WebSocketClient();
+    const srvSockP = srv.nextSocket();
+    await ws.connect(`ws://127.0.0.1:${srv.port}`);
+    const srvSock  = await srvSockP;
+
+    const received: Buffer[] = [];
+    const twoFramesP = new Promise<void>((resolve) => {
+      let buf = Buffer.alloc(0);
+      srvSock.on('data', (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        // Each frame: [0]=opcode, [1]=0x80|len, [2-5]=mask, [6...]=payload (for small payloads)
+        while (buf.length >= 6) {
+          const len  = buf[1]! & 0x7f;
+          if (buf.length < 6 + len) break;
+          const maskKey  = buf.subarray(2, 6);
+          const masked   = buf.subarray(6, 6 + len);
+          const unmasked = Buffer.allocUnsafe(len);
+          for (let i = 0; i < len; i++) unmasked[i] = masked[i]! ^ maskKey[i % 4]!;
+          received.push(unmasked);
+          buf = buf.subarray(6 + len);
+          if (received.length === 2) resolve();
+        }
+      });
+    });
+
+    ws.send(Buffer.from([0x01, 0x02, 0x03]));          // Buffer path
+    ws.send(new Uint8Array([0x04, 0x05, 0x06]));       // Uint8Array path (line 179)
+
+    await twoFramesP;
+    expect(Buffer.compare(received[0]!, Buffer.from([0x01, 0x02, 0x03]))).toBe(0);
+    expect(Buffer.compare(received[1]!, Buffer.from([0x04, 0x05, 0x06]))).toBe(0);
+
+    ws.close();
+    srvSock.destroy();
+  });
+
+  // 23. Handshake response split across two TCP writes: indexOfCRLFCRLF returns -1 then finds it (line 393)
+  it('handshake response split over two TCP writes buffers correctly (line 393 in source)', async () => {
+    // Spin up a custom server that deliberately sends the HTTP 101 response in two chunks
+    const splitServer = net.createServer((sock: net.Socket) => {
+      let incoming = Buffer.alloc(0);
+      sock.on('data', (chunk: Buffer) => {
+        incoming = Buffer.concat([incoming, chunk]);
+        // Wait for the full upgrade request
+        if (!incoming.includes(Buffer.from('\r\n\r\n'))) return;
+        const match = incoming.toString('utf8').match(/Sec-WebSocket-Key: ([^\r\n]+)/);
+        if (!match) { sock.destroy(); return; }
+        const accept = crypto.createHash('sha1').update(match[1]!.trim() + WS_GUID).digest('base64');
+        const fullResp = [
+          'HTTP/1.1 101 Switching Protocols',
+          'Upgrade: websocket',
+          'Connection: Upgrade',
+          `Sec-WebSocket-Accept: ${accept}`,
+          '\r\n',
+        ].join('\r\n');
+        // Send only the first 20 bytes → no \r\n\r\n yet → indexOfCRLFCRLF returns -1 (line 393)
+        sock.write(fullResp.slice(0, 20));
+        // Send the rest after a short delay
+        setTimeout(() => sock.write(fullResp.slice(20)), 30);
+      });
+    });
+    await new Promise<void>((r) => splitServer.listen(0, '127.0.0.1', r));
+    const { port: splitPort } = splitServer.address() as net.AddressInfo;
+
+    const ws = new WebSocketClient();
+    await ws.connect(`ws://127.0.0.1:${splitPort}`);
+    expect(ws.readyState).toBe(WebSocketReadyState.Open);
+
+    ws.close();
+    await new Promise<void>((r) => splitServer.close(() => r()));
+  });
 });

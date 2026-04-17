@@ -163,6 +163,13 @@ describe('MsgpackHubProtocol round-trips', () => {
     expect((out as { invocationId?: unknown }).invocationId).toBeUndefined();
   });
 
+  it('MsgpackHubProtocol.send() with streamIds includes streamIds (line 421)', () => {
+    const msg = MsgpackHubProtocol.send('Upload', [], ['sid1', 'sid2']);
+    const out = roundtrip(msg);
+    expect(out.type).toBe(MessageType.Invocation);
+    expect((out as { streamIds?: string[] }).streamIds).toEqual(['sid1', 'sid2']);
+  });
+
   it('Invocation with streamIds', () => {
     const id  = toInvocationId('2');
     const msg = MsgpackHubProtocol.invocation(id, 'Upload', [], ['s1', 's2']);
@@ -420,6 +427,66 @@ describe('MsgpackHubProtocol.parseMessages - validation errors', () => {
     // VarInt says 100 bytes but buffer only has 5
     const frame = new Uint8Array([100, 0x91, 0x06, 0x00, 0x00]); // varint(100) + tiny data
     expect(() => p.parseMessages(frame.buffer, log)).toThrow(/length/i);
+  });
+
+  it('throws when VarInt frame prefix is truncated (continuation bit set, no next byte) (line 95)', () => {
+    // 0x80 has the continuation bit set but there is no second byte
+    const frame = new Uint8Array([0x80]);
+    expect(() => p.parseMessages(frame.buffer, log)).toThrow(/unexpected end of data/i);
+  });
+
+  // ── Headers branch coverage ───────────────────────────────────────────────
+
+  it('StreamInvocation with non-empty headers preserves them (line 362)', () => {
+    // [type=4, headers={x-h:"1"}, invocationId, target, arguments]
+    const buf = rawFrame([4, { 'x-h': '1' }, 'id-1', 'Target', []]);
+    const msgs = p.parseMessages(buf, log);
+    expect(msgs[0]!.type).toBe(MessageType.StreamInvocation);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-h']).toBe('1');
+  });
+
+  it('CancelInvocation with non-empty headers preserves them (line 376)', () => {
+    // [type=5, headers={x-h:"2"}, invocationId]
+    const buf = rawFrame([5, { 'x-h': '2' }, 'id-2']);
+    const msgs = p.parseMessages(buf, log);
+    expect(msgs[0]!.type).toBe(MessageType.CancelInvocation);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-h']).toBe('2');
+  });
+
+  it('Completion Error with null error message uses empty string fallback (line 330 ?? branch)', () => {
+    // [type=3, headers={}, invocationId, resultKind=Error(1), null]
+    // arr[4] is null → exercises String(arr[4] ?? '') → ''
+    const buf = rawFrame([3, {}, 'id-3', 1, null]);
+    const msgs = p.parseMessages(buf, log);
+    expect(msgs[0]!.type).toBe(MessageType.Completion);
+    expect((msgs[0] as { error?: string }).error).toBe('');
+  });
+
+  it('fire-and-forget Invocation (send) with headers preserves them (line 298)', () => {
+    // [type=1, headers={x-ff:"1"}, no invocationId (""), target, arguments]
+    // arr[1] non-empty → isNonEmptyObject TRUE branch on line 298
+    const buf = rawFrame([1, { 'x-ff': '1' }, '', 'Target', []]);
+    const msgs = p.parseMessages(buf, log);
+    expect(msgs[0]!.type).toBe(MessageType.Invocation);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-ff']).toBe('1');
+  });
+
+  it('StreamItem with non-empty headers preserves them (line 313)', () => {
+    // [type=2, headers={x-si:"v"}, invocationId, item]
+    // arr[1] non-empty → isNonEmptyObject TRUE branch on line 313
+    const buf = rawFrame([2, { 'x-si': 'v' }, 'id-si', 'item-value']);
+    const msgs = p.parseMessages(buf, log);
+    expect(msgs[0]!.type).toBe(MessageType.StreamItem);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-si']).toBe('v');
+  });
+
+  it('Completion with non-empty headers uses headers branch (line 326 true branch)', () => {
+    // [type=3, headers={x-c:"ok"}, invocationId, resultKind=Void(2)]
+    // isNonEmptyObject(arr[1]) TRUE → hdrs = { headers: ... }
+    const buf = rawFrame([3, { 'x-c': 'ok' }, 'id-c', 2]);
+    const msgs = p.parseMessages(buf, log);
+    expect(msgs[0]!.type).toBe(MessageType.Completion);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-c']).toBe('ok');
   });
 });
 

@@ -164,6 +164,33 @@ function registerCommonTests(label: string, factory: (srv: TestServer) => IHttpC
       ).rejects.toThrow(/ECONNREFUSED|connect|fetch failed/i);
     });
 
+    it('stream() rejects when the connection cannot be established', async () => {
+      await expect(
+        client.stream('GET', 'http://127.0.0.1:1/nowhere'),
+      ).rejects.toThrow(/ECONNREFUSED|connect|fetch failed/i);
+    });
+
+    it('stream() sends request body when provided (exercises undici body: Buffer)', async () => {
+      const result = await client.stream('POST', url('/echo'), {
+        body:    'stream-payload',
+        headers: { 'Content-Type': 'text/plain' },
+      });
+      expect(result.statusCode).toBe(200);
+
+      const chunks: Buffer[] = [];
+      await new Promise<void>((resolve, reject) => {
+        result.body.on('data',  (c: Buffer) => chunks.push(c));
+        result.body.on('end',   resolve);
+        result.body.on('error', reject);
+      });
+      const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+        method: string;
+        body:   string;
+      };
+      expect(parsed.method).toBe('POST');
+      expect(parsed.body).toBe('stream-payload');
+    });
+
     it('stream() returns a Readable with correct status and headers', async () => {
       const result = await client.stream('GET', url('/stream'));
       expect(result.statusCode).toBe(200);
@@ -343,6 +370,19 @@ describe('Request timeout', () => {
     await expect(() => c.get(url('/timeout'))).rejects.toThrow(/timeout|timed out|abort/i);
   });
 
+  it('FetchHttpClient with timeout 0 does not schedule abort timer', async () => {
+    const c = new FetchHttpClient({ timeout: 0 });
+    const res = await c.get(url('/echo'));
+    expect(res.status).toBe(200);
+  });
+
+  it('FetchHttpClient with timeout 0 uses catch path without clearTimeout (no timer)', async () => {
+    const c = new FetchHttpClient({ timeout: 0 });
+    await expect(() => c.get('http://127.0.0.1:1/echo')).rejects.toThrow(
+      /ECONNREFUSED|fetch failed|connect/i,
+    );
+  });
+
   it('StreamHttpClient times out', async () => {
     const c = new StreamHttpClient({ timeout: 100 });
     await expect(() => c.get(url('/timeout'))).rejects.toThrow(/timeout|timed out/i);
@@ -356,5 +396,63 @@ describe('Request timeout', () => {
   it('DispatchHttpClient times out', async () => {
     const c = new DispatchHttpClient({ timeout: 100 });
     await expect(() => c.get(url('/timeout'))).rejects.toThrow(/timeout|timed out/i);
+  });
+
+  it('DispatchHttpClient with timeout 0 skips the timer block (lines 655-662 false branch)', async () => {
+    const c = new DispatchHttpClient({ timeout: 0 });
+    const res = await c.get(url('/echo'));
+    expect(res.status).toBe(200);
+  });
+});
+
+// ─── DispatchHttpClient.stream() — else branch of !resolved (L763) ───────────
+//
+// In normal operation undici calls onResponseStart exactly once.  The guard
+// `if (!resolved)` is defensive: if it were somehow called a second time the
+// false branch silently does nothing.  We cover that branch by supplying a fake
+// Dispatcher whose dispatch() method hands back the captured handler so we can
+// invoke onResponseStart a second time ourselves.
+
+import type { Dispatcher } from 'undici';
+
+describe('DispatchHttpClient.stream - else branch of !resolved (L763)', () => {
+  it('second onResponseStart call is silently ignored (covers else branch)', async () => {
+    type DispatchHandler = Dispatcher.DispatchHandler;
+
+    let capturedHandler: DispatchHandler | null = null;
+
+    // Minimal fake Dispatcher: just captures the handler and does nothing else.
+    const fakeDispatcher = {
+      dispatch(
+        _opts:   Dispatcher.DispatchOptions,
+        handler: DispatchHandler,
+      ): boolean {
+        capturedHandler = handler;
+        return true;
+      },
+    } as unknown as Dispatcher;
+
+    const client = new DispatchHttpClient({ dispatcher: fakeDispatcher });
+
+    // stream() calls dispatch() synchronously, so capturedHandler is set by
+    // the time the next line executes.
+    const streamPromise = client.stream('GET', 'http://example.com/test');
+
+    expect(capturedHandler).not.toBeNull();
+
+    const fakeCtrl = null as unknown as Dispatcher.DispatchController;
+
+    // ── First call: resolved = false → TRUE branch ────────────────────────
+    // Sets resolved = true and resolves the Promise.
+    (capturedHandler as DispatchHandler).onResponseStart!(fakeCtrl, 200, {});
+
+    const result = await streamPromise;
+    expect(result.statusCode).toBe(200);
+
+    // ── Second call: resolved = true → FALSE branch (else) ────────────────
+    // The `if (!resolved)` guard is now false; the block is skipped silently.
+    expect(() => {
+      (capturedHandler as DispatchHandler).onResponseStart!(fakeCtrl, 200, {});
+    }).not.toThrow();
   });
 });

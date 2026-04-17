@@ -159,6 +159,8 @@ export class WebSocketTransport implements ITransport {
         this.#logger.log(LogLevel.Trace,
           `(WebSockets transport) Received text (${data.length} chars).`);
         this.onreceive?.(data);
+      /* istanbul ignore else - binaryType='arraybuffer' constrains delivery
+         to string | ArrayBuffer; any other type is unreachable in practice. */
       } else if (data instanceof ArrayBuffer) {
         const buf = Buffer.from(data);
         this.#logger.log(LogLevel.Trace,
@@ -209,6 +211,8 @@ export class WebSocketTransport implements ITransport {
       // ArrayBufferView | Blob.  Uint8Array satisfies ArrayBufferView.
       this.#ws.send(data);
       return Promise.resolve();
+    /* istanbul ignore next - ws.send() on an already-open socket does not
+       throw synchronously; this catch is a belt-and-suspenders fallback. */
     } catch (err) {
       return Promise.reject(err instanceof Error ? err : new Error(String(err)));
     }

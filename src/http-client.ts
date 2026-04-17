@@ -127,34 +127,6 @@ function buildHeaders(
 }
 
 /**
- * Convert undici's flat alternating-key/value raw-header array
- * (`[name, value, name, value, …]`) into a plain object.
- *
- * Note: undici 8's `DispatchHandler.onResponseStart` delivers headers pre-parsed,
- * so this helper is no longer used by `DispatchHttpClient`.  It is kept here for
- * completeness and potential use in tests or future low-level code.
- */
-function parseRawHeaders(
-  raw: (Buffer | string)[] | null,
-): Record<string, string | string[]> {
-  if (!raw) return {};
-  const out: Record<string, string | string[]> = {};
-  for (let i = 0; i + 1 < raw.length; i += 2) {
-    const key = raw[i]!.toString().toLowerCase();
-    const val = raw[i + 1]!.toString();
-    const existing = out[key];
-    if (existing === undefined) {
-      out[key] = val;
-    } else if (Array.isArray(existing)) {
-      existing.push(val);
-    } else {
-      out[key] = [existing, val];
-    }
-  }
-  return out;
-}
-
-/**
  * Normalise an undici response headers object
  * (`Record<string, string | string[]>`) to our `HttpResponse.headers` shape
  * (`Record<string, string | string[] | undefined>`).
@@ -499,7 +471,10 @@ export class StreamHttpClient extends BaseUndiciClient {
           return pt;
         },
       ).catch((err: unknown) => {
-        pt.destroy(err instanceof Error ? err : new Error(String(err)));
+        // Connection failed before headers: Promise has not resolved, so no
+        // caller holds a reference to `pt`.  Destroy it without an error arg
+        // to avoid emitting an unhandled 'error' event on an orphaned stream.
+        pt.destroy();
         reject(err);
       });
     });
@@ -766,8 +741,18 @@ export class DispatchHttpClient extends BaseUndiciClient {
           },
 
           onResponseError: (_ctrl: Dispatcher.DispatchController, err: Error): void => {
-            pt.destroy(err);
-            if (!resolved) reject(err);
+            if (!resolved) {
+              // Promise not yet resolved: reject it. The PassThrough stream has
+              // not been handed to the caller yet, so destroy it silently to
+              // avoid an unhandled 'error' event on a stream nobody is reading.
+              resolved = true;
+              pt.destroy();
+              reject(err);
+            } else {
+              // Response headers were already delivered; propagate the error
+              // through the stream so the caller's reader sees it.
+              pt.destroy(err);
+            }
           },
 
           onResponseStart: (

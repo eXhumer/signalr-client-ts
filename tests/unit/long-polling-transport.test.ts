@@ -61,6 +61,7 @@ import { LongPollingTransport } from '../../src/transports/long-polling-transpor
 import { TransferFormat }       from '../../src/constants.js';
 import { RequestHttpClient }    from '../../src/http-client.js';
 import { MockLogger }           from '../helpers/mock-logger.js';
+import type { IHttpClient, HttpResponse } from '../../src/interfaces.js';
 
 // ─── LongPoll test server ─────────────────────────────────────────────────────
 
@@ -517,5 +518,178 @@ describe('LongPollingTransport', () => {
     ).resolves.toBeUndefined();
 
     await closedP;
+  });
+});
+
+// ─── Mock IHttpClient tests (catch-block + buildHeaders coverage) ─────────────
+
+function makeMockClient(overrides: {
+  get?:    (url: string, opts?: unknown) => Promise<HttpResponse>;
+  post?:   (url: string, opts?: unknown) => Promise<HttpResponse>;
+  delete?: (url: string, opts?: unknown) => Promise<HttpResponse>;
+}): IHttpClient {
+  const ok: HttpResponse = { status: 200, headers: {}, body: '' };
+  return {
+    get:     overrides.get    ?? (() => Promise.resolve(ok)),
+    post:    overrides.post   ?? (() => Promise.resolve(ok)),
+    delete:  overrides.delete ?? (() => Promise.resolve(ok)),
+    request: () => Promise.resolve(ok),
+    stream:  () => Promise.reject(new Error('not implemented')),
+  } as unknown as IHttpClient;
+}
+
+describe('LongPollingTransport - mock IHttpClient (catch-block + buildHeaders coverage)', () => {
+
+  it('accessTokenFactory returning a token sends Authorization header (lines 164-165)', async () => {
+    let capturedAuth = '';
+    const mockClient = makeMockClient({
+      get: async (_url: string, opts?: unknown) => {
+        capturedAuth = (opts as { headers?: Record<string, string> })?.headers?.['Authorization'] ?? '';
+        return { status: 204, headers: {}, body: '' };
+      },
+    });
+    const logger = new MockLogger();
+    const transport = new LongPollingTransport(
+      mockClient, async () => 'bearer-abc', logger, {},
+    );
+    const closedP = new Promise<void>((r) => { transport.onclose = (): void => r(); });
+    await transport.connect('http://fake.invalid/poll', TransferFormat.Text);
+    await closedP;
+    expect(capturedAuth).toBe('Bearer bearer-abc');
+  });
+
+  it('accessTokenFactory returning null sends no Authorization header (lines 164-165)', async () => {
+    let capturedHeaders: Record<string, string> = {};
+    const mockClient = makeMockClient({
+      get: async (_url: string, opts?: unknown) => {
+        capturedHeaders = (opts as { headers?: Record<string, string> })?.headers ?? {};
+        return { status: 204, headers: {}, body: '' };
+      },
+    });
+    const logger = new MockLogger();
+    const transport = new LongPollingTransport(
+      mockClient, async () => null, logger, {},
+    );
+    const closedP = new Promise<void>((r) => { transport.onclose = (): void => r(); });
+    await transport.connect('http://fake.invalid/poll', TransferFormat.Text);
+    await closedP;
+    expect('Authorization' in capturedHeaders).toBeFalsy();
+  });
+
+  it('poll GET throws while running → onclose fires with the error (line 133)', async () => {
+    let callCount = 0;
+    const mockClient = makeMockClient({
+      get: async () => {
+        callCount++;
+        if (callCount === 1) return { status: 200, headers: {}, body: '' };
+        throw new Error('simulated network failure');
+      },
+    });
+    const logger = new MockLogger();
+    const transport = new LongPollingTransport(mockClient, null, logger, {});
+    let closedErr: Error | undefined;
+    const closedP = new Promise<void>((r) => {
+      transport.onclose = (err?: Error): void => { closedErr = err; r(); };
+    });
+    await transport.connect('http://fake.invalid/poll', TransferFormat.Text);
+    await closedP;
+    expect(closedErr instanceof Error).toBeTruthy();
+    expect(closedErr!.message).toMatch(/simulated network failure/);
+  });
+
+  it('poll GET throws after stop() → error swallowed, onclose not called (line 132)', async () => {
+    let resolveGet!: (v: HttpResponse) => void;
+    let rejectGet!:  (e: Error) => void;
+    let callCount = 0;
+    const mockClient = makeMockClient({
+      get: async () => {
+        callCount++;
+        if (callCount === 1) return { status: 200, headers: {}, body: '' };
+        return new Promise<HttpResponse>((res, rej) => {
+          resolveGet = res; rejectGet = rej;
+        });
+      },
+    });
+    const logger = new MockLogger();
+    const transport = new LongPollingTransport(mockClient, null, logger, {});
+    let closeCalled = false;
+    transport.onclose = (): void => { closeCalled = true; };
+    await transport.connect('http://fake.invalid/poll', TransferFormat.Text);
+    // Wait for background poll to start its second GET
+    await new Promise<void>((r) => {
+      const tick = (): void => { if (callCount >= 2) r(); else setImmediate(tick); };
+      setImmediate(tick);
+    });
+    await transport.stop();
+    rejectGet(new Error('connection reset after stop'));
+    await new Promise<void>((r) => setTimeout(r, 50));
+    expect(closeCalled).toBe(false);
+  });
+
+  it('stop() before connect() is a no-op: hits false branches at lines 82 and 87', async () => {
+    // #pollImmediate is null (never scheduled) → line 82 false branch
+    // #url is null (never connected) → line 87 false branch
+    const mockClient = makeMockClient({});
+    const logger = new MockLogger();
+    const transport = new LongPollingTransport(mockClient, null, logger);
+    await expect(transport.stop()).resolves.toBeUndefined();
+  });
+
+  // ── L118 optional-chain null branch: onclose not set when poll errors ────
+  // When a background poll throws and this.onclose is null, the optional-call
+  // this.onclose?.(...) short-circuits (branch 1 of the ?. operator).
+  // The error must still be logged, and stop() should observe the transport
+  // is no longer running.
+
+  it('poll error with no onclose handler: error is logged, onclose?.() is a no-op (L125 ?. branch)', async () => {
+    let callCount = 0;
+    const mockClient = makeMockClient({
+      get: async () => {
+        callCount++;
+        if (callCount === 1) return { status: 200, headers: {}, body: '' };
+        throw new Error('background-poll-failure');
+      },
+    });
+    const logger = new MockLogger();
+    const transport = new LongPollingTransport(mockClient, null, logger, {});
+    // Intentionally leave transport.onclose as null - covers the ?. null branch.
+
+    await transport.connect('http://fake.invalid/poll', TransferFormat.Text);
+
+    // Wait for the background poll to fail and log the error.
+    await waitFor(() => logger.hasMessage('Poll error'), 2_000);
+
+    expect(logger.hasMessage('Poll error')).toBeTruthy();
+    expect(logger.hasMessage('background-poll-failure')).toBeTruthy();
+  });
+
+  // ── L125 ternary false branch: poll throws a non-Error value ─────────────
+  // JavaScript allows throwing any value.  When err is not an Error instance,
+  // the ternary `err instanceof Error ? err : new Error(String(err))` takes
+  // the false branch (branch 1) and wraps the value in a new Error.
+
+  it('poll throws a non-Error value: new Error(String(err)) wraps it (L125 ternary branch)', async () => {
+    let callCount = 0;
+    const mockClient = makeMockClient({
+      get: async () => {
+        callCount++;
+        if (callCount === 1) return { status: 200, headers: {}, body: '' };
+        // eslint-disable-next-line @typescript-eslint/only-throw-error
+        throw 'string-thrown-by-poll'; // non-Error value → ternary false branch
+      },
+    });
+    const logger = new MockLogger();
+    const transport = new LongPollingTransport(mockClient, null, logger, {});
+    let closedErr: Error | undefined;
+    const closedP = new Promise<void>((r) => {
+      transport.onclose = (err?: Error): void => { closedErr = err; r(); };
+    });
+
+    await transport.connect('http://fake.invalid/poll', TransferFormat.Text);
+    await closedP;
+
+    // The string was wrapped in new Error(String('string-thrown-by-poll'))
+    expect(closedErr instanceof Error).toBeTruthy();
+    expect(closedErr!.message).toBe('string-thrown-by-poll');
   });
 });

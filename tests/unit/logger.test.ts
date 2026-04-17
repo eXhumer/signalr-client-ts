@@ -96,6 +96,18 @@ describe('ConsoleLogger', () => {
     expect(debugs.some((l) => l.includes('trace1'))).toBeTruthy();
     expect(debugs.some((l) => l.includes('debug1'))).toBeTruthy();
   });
+
+  it('falls back to the numeric string for an unknown level (line 66 fallback path)', () => {
+    const logged: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logged.push(String(args[0]));
+    });
+    const logger = new ConsoleLogger(LogLevel.Trace);
+    logger.log(99 as LogLevel, 'unknown-level-message');
+    spy.mockRestore();
+    expect(logged.some((l) => l.includes('99'))).toBeTruthy();
+    expect(logged.some((l) => l.includes('unknown-level-message'))).toBeTruthy();
+  });
 });
 
 describe('resolveLogger', () => {

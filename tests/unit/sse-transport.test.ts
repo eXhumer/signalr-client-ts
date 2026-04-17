@@ -599,4 +599,112 @@ describe('ServerSentEventsTransport', () => {
     await transport.stop();
     res.end();
   });
+
+  // ── 18. Buffer with both \n\n and \r\n\r\n delimiters (line 167 branch) ───
+
+  it('buffer with both \\n\\n and \\r\\n\\r\\n delimiters dispatches both events (line 167)', async () => {
+    // When the buffer is 'data: first\n\ndata: second\r\n\r\n':
+    //   i1=11 (\n\n), i2=25 (\r\n\r\n) → both non-(-1) → Math.min(13,29)=13 (line 167)
+    const { transport } = makeTransport();
+    const resP = srv.nextGetHandler();
+    await transport.connect(srv.url, TransferFormat.Text);
+    const res = await resP;
+
+    const received: string[] = [];
+    transport.onreceive = (data: string | Uint8Array): void => {
+      received.push(typeof data === 'string' ? data : Buffer.from(data).toString());
+    };
+
+    res.write('data: first\n\ndata: second\r\n\r\n');
+    await waitFor(() => received.length >= 2);
+
+    expect(received[0]).toBe('first');
+    expect(received[1]).toBe('second');
+
+    await transport.stop();
+    res.end();
+  });
+
+  // ── 19. send() before connect() throws (line 97 true branch) ──────────────
+
+  it('send() before connect() rejects with "not connected" (line 97)', async () => {
+    const { transport } = makeTransport();
+    await expect(
+      () => transport.send('hello'),
+    ).rejects.toThrow(/not connected/i);
+  });
+
+  // ── 20. stop() before connect() is a no-op (line 120 false branch) ─────────
+
+  it('stop() before connect() resolves without error (line 120 false branch)', async () => {
+    const { transport } = makeTransport();
+    await expect(transport.stop()).resolves.toBeUndefined();
+  });
+
+  // ── 21. SSE block with no data: lines is discarded (line 151 true branch) ──
+
+  it('SSE event block with no data: field is silently discarded (line 151)', async () => {
+    const { transport } = makeTransport();
+    const resP = srv.nextGetHandler();
+    await transport.connect(srv.url, TransferFormat.Text);
+    const res = await resP;
+
+    let received = false;
+    transport.onreceive = (): void => { received = true; };
+
+    // An SSE block with only an event: field and no data: field
+    res.write('event: update\n\n');
+    await new Promise<void>((r) => setTimeout(r, 60));
+
+    expect(received).toBe(false);
+    await transport.stop();
+    res.end();
+  });
+
+  // ── 22. send() with accessTokenFactory returning null (line 108 false branch)
+
+  it('send() with accessTokenFactory returning null sends no Authorization header (line 108)', async () => {
+    const logger    = new MockLogger();
+    const transport = new ServerSentEventsTransport(
+      new RequestHttpClient({ timeout: 5_000, dispatcher: new Agent() }),
+      async () => null,  // returns null → no Authorization header
+      logger,
+      {},
+    );
+    const resP = srv.nextGetHandler();
+    await transport.connect(srv.url, TransferFormat.Text);
+    const res = await resP;
+
+    await transport.send('payload-null-token');
+    expect(srv.posts.at(-1)).toBe('payload-null-token');
+
+    await transport.stop();
+    res.end();
+  });
+
+  // ── 23. Construct without extraHeaders arg → default = {} is used (line 37) ─
+
+  it('constructed without extraHeaders uses default empty object (line 37)', async () => {
+    // Omitting the 4th argument exercises the default parameter branch `= {}`
+    const logger    = new MockLogger();
+    const transport = new ServerSentEventsTransport(
+      new RequestHttpClient({ timeout: 5_000, dispatcher: new Agent() }),
+      null,
+      logger,
+      // intentionally omit extraHeaders → default {} is used
+    );
+    const resP = srv.nextGetHandler();
+    await transport.connect(srv.url, TransferFormat.Text);
+    const res = await resP;
+
+    // Verify the transport works normally with the defaulted empty extraHeaders
+    const received: string[] = [];
+    transport.onreceive = (d): void => { received.push(d as string); };
+    res.write('data: hello-default\n\n');
+    await new Promise<void>((r) => setTimeout(r, 60));
+    expect(received[0]).toBe('hello-default');
+
+    await transport.stop();
+    res.end();
+  });
 });

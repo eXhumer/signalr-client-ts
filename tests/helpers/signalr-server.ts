@@ -24,8 +24,18 @@ const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 export interface ServerClient extends EventEmitter {
   /** Send a raw SignalR message (record separator appended automatically). */
   sendMessage(payload: Record<string, unknown>): void;
-  /** Close the WebSocket connection from the server side. */
+  /**
+   * Close the WebSocket connection abruptly (TCP destroy).
+   * The client sees an error because there is no proper WS close frame.
+   */
   close(): void;
+  /**
+   * Close the WebSocket connection gracefully by sending a WS Close frame
+   * (opcode 0x08, no payload) before tearing down the TCP socket.
+   * The client receives a clean close event with no error, which means
+   * `#onTransportClosed` is invoked with `err = undefined`.
+   */
+  closeGracefully(): void;
   on(event: 'message', listener: (msg: Record<string, unknown>) => void): this;
   on(event: 'close',   listener: () => void): this;
 }
@@ -62,6 +72,20 @@ export interface SignalRTestServer {
    * Primarily used to inject `Set-Cookie` headers for cookie tests.
    */
   negotiateResponseHeaders: Record<string, string>;
+  /**
+   * When set to a non-empty string, the server sends this JSON (plus a record
+   * separator) as the handshake response instead of the normal `{}\x1e`.
+   * Reset to `''` after each use so it doesn't affect subsequent connections.
+   * Used to test error-handshake paths (L544-549 in hub-connection.ts).
+   */
+  handshakeResponse: string;
+  /**
+   * When `true`, the server accepts the WebSocket upgrade and waits for the
+   * client's SignalR handshake request, but deliberately never sends a
+   * handshake response.  Used to trigger the handshake-timeout code-path
+   * (L521 in hub-connection.ts).  Reset to `false` after each use.
+   */
+  hangHandshake: boolean;
   /** Resolves when the next client connects; returns control handle. */
   nextClient(): Promise<ServerClient>;
   close(): Promise<void>;
@@ -71,6 +95,8 @@ export interface SignalRTestServer {
 
 export async function startSignalRServer(): Promise<SignalRTestServer> {
   const pending:     Array<(c: ServerClient) => void> = [];
+  let   handshakeResponse = '';
+  let   hangHandshake     = false;
   const activeSockets = new Set<net.Socket>();
   const requestUrls:  string[] = [];
   const requests:     CapturedRequest[] = [];
@@ -119,7 +145,9 @@ export async function startSignalRServer(): Promise<SignalRTestServer> {
     // above for the same socket object.
     if (req.url) requestUrls.push(req.url);
     requests.push({ url: req.url ?? '', headers: req.headers as Record<string, string | string[] | undefined> });
-    void handleUpgrade(req, socket, head, pending);
+    void handleUpgrade(req, socket, head, pending, handshakeResponse, hangHandshake);
+    handshakeResponse = ''; // reset after each use
+    hangHandshake     = false; // reset after each use
   });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -132,6 +160,10 @@ export async function startSignalRServer(): Promise<SignalRTestServer> {
     requests,
     get negotiateResponseHeaders() { return negotiateResponseHeaders; },
     set negotiateResponseHeaders(v: Record<string, string>) { negotiateResponseHeaders = v; },
+    get handshakeResponse() { return handshakeResponse; },
+    set handshakeResponse(v: string) { handshakeResponse = v; },
+    get hangHandshake() { return hangHandshake; },
+    set hangHandshake(v: boolean) { hangHandshake = v; },
 
     nextClient(): Promise<ServerClient> {
       return new Promise<ServerClient>((resolve) => {
@@ -154,10 +186,12 @@ export async function startSignalRServer(): Promise<SignalRTestServer> {
 // ─── WebSocket upgrade handler ────────────────────────────────────────────────
 
 async function handleUpgrade(
-  req:    http.IncomingMessage,
-  socket: net.Socket,
-  _head:  Buffer,
-  pending: Array<(c: ServerClient) => void>,
+  req:              http.IncomingMessage,
+  socket:           net.Socket,
+  _head:            Buffer,
+  pending:          Array<(c: ServerClient) => void>,
+  hsResponseOverride: string = '',
+  hangHandshake:      boolean = false,
 ): Promise<void> {
   const key    = req.headers['sec-websocket-key'];
   if (typeof key !== 'string') { socket.destroy(); return; }
@@ -179,9 +213,13 @@ async function handleUpgrade(
     client.once('rawMessage', resolve as (s: string) => void);
   });
 
-  // Echo back an empty handshake response
+  // When hangHandshake is true we intentionally never send a response so that
+  // the client's handshake timer (L521 in hub-connection.ts) fires.
+  if (hangHandshake) return;
+
+  // Echo back an empty handshake response (or an override for error-path tests)
   if (firstMsg.includes('"protocol"')) {
-    socket.write(encodeTextFrame('{}\x1e'));
+    socket.write(encodeTextFrame(hsResponseOverride || '{}\x1e'));
   }
 
   const resolver = pending.shift();
@@ -207,6 +245,15 @@ class ServerClientImpl extends EventEmitter implements ServerClient {
   }
 
   close(): void { this.#socket.destroy(); }
+
+  closeGracefully(): void {
+    // RFC 6455 close frame: FIN=1, opcode=8 (CLOSE), no mask, no payload.
+    // Sending this causes undici's WebSocket to fire the 'close' event
+    // without an error, so #onTransportClosed receives err=undefined.
+    this.#socket.write(Buffer.from([0x88, 0x00]));
+    // Allow the write to flush and the client to echo before tearing down.
+    this.#socket.end();
+  }
 
   #onData(chunk: Buffer): void {
     this.#buf = Buffer.concat([this.#buf, chunk]);

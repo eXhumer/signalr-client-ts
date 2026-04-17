@@ -10,6 +10,7 @@ import {
   TransportError,
   HandshakeError,
   UnsupportedTransportError,
+  RedirectError,
   isHubError,
   isAbortError,
   isTransportError,
@@ -113,5 +114,38 @@ describe('Type-guard helpers', () => {
     expect(isTransportError(hub)).toBeFalsy();
     expect(isHubError(abort)).toBeFalsy();
     expect(isHubError(transport)).toBeFalsy();
+  });
+});
+
+// ─── RedirectError (lines 71-79) ─────────────────────────────────────────────
+
+describe('RedirectError', () => {
+  it('name is "RedirectError"', () => {
+    expect(new RedirectError('https://example.com').name).toBe('RedirectError');
+  });
+
+  it('message includes the redirect URL', () => {
+    expect(new RedirectError('https://example.com').message).toMatch(/https:\/\/example\.com/);
+  });
+
+  it('url property stores the redirect target', () => {
+    expect(new RedirectError('https://example.com').url).toBe('https://example.com');
+  });
+
+  it('accessToken is undefined when omitted', () => {
+    expect(new RedirectError('https://example.com').accessToken).toBeUndefined();
+  });
+
+  it('accessToken is stored when provided', () => {
+    expect(new RedirectError('https://redirect.io', 'tok123').accessToken).toBe('tok123');
+  });
+
+  it('is an instance of Error', () => {
+    expect(new RedirectError('https://example.com') instanceof Error).toBeTruthy();
+  });
+
+  it('instanceof RedirectError is true (new.target prototype fix)', () => {
+    const err = new RedirectError('https://redirect.io');
+    expect(err instanceof RedirectError).toBeTruthy();
   });
 });

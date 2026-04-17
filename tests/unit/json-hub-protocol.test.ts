@@ -226,6 +226,21 @@ describe('JsonHubProtocol.parseMessages', () => {
     expect('streamIds' in out).toBeTruthy();
     expect([...(out as unknown as { streamIds: string[] }).streamIds]).toEqual(['s1', 's2']);
   });
+
+  it('JsonHubProtocol.send() with streamIds includes streamIds (line 273)', () => {
+    const msg = JsonHubProtocol.send('UploadFile', [], ['stream-1', 'stream-2']);
+    const out = roundtrip(msg);
+    expect(out.type).toBe(MessageType.Invocation);
+    expect([...(out as unknown as { streamIds: string[] }).streamIds]).toEqual(['stream-1', 'stream-2']);
+  });
+
+  it('JsonHubProtocol.streamInvocation() with streamIds includes streamIds (line 288)', () => {
+    const id  = toInvocationId('si-1');
+    const msg = JsonHubProtocol.streamInvocation(id, 'UploadStream', [100], ['src-a', 'src-b']);
+    const out = roundtrip(msg);
+    expect(out.type).toBe(MessageType.StreamInvocation);
+    expect([...(out as unknown as { streamIds: string[] }).streamIds]).toEqual(['src-a', 'src-b']);
+  });
 });
 
 describe('JsonHubProtocol metadata', () => {
@@ -341,5 +356,47 @@ describe('JsonHubProtocol.parseMessages - required-field validation (protocol co
     const msg = msgs[0]!;
     expect(msg.type).toBe(MessageType.Close);
     expect(!('allowReconnect' in msg) || (msg as { allowReconnect?: boolean }).allowReconnect === undefined).toBeTruthy();
+  });
+
+  it('Close message with headers field preserves headers (line 227)', () => {
+    const wire = `{"type":7,"headers":{"x-close-reason":"overload"}}${RS}`;
+    const msgs = p.parseMessages(wire, log);
+    expect(msgs[0]!.type).toBe(MessageType.Close);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-close-reason']).toBe('overload');
+  });
+
+  it('CancelInvocation with headers field preserves headers (line 240)', () => {
+    const wire = `{"type":5,"invocationId":"1","headers":{"x-trace":"abc"}}${RS}`;
+    const msgs = p.parseMessages(wire, log);
+    expect(msgs[0]!.type).toBe(MessageType.CancelInvocation);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-trace']).toBe('abc');
+  });
+
+  it('Invocation with headers field preserves headers (line 168)', () => {
+    const wire = `{"type":1,"target":"Foo","arguments":[],"headers":{"x-req":"abc"}}${RS}`;
+    const msgs = p.parseMessages(wire, log);
+    expect(msgs[0]!.type).toBe(MessageType.Invocation);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-req']).toBe('abc');
+  });
+
+  it('StreamItem with headers field preserves headers (line 180)', () => {
+    const wire = `{"type":2,"invocationId":"1","item":42,"headers":{"x-item":"v"}}${RS}`;
+    const msgs = p.parseMessages(wire, log);
+    expect(msgs[0]!.type).toBe(MessageType.StreamItem);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-item']).toBe('v');
+  });
+
+  it('Completion with headers field preserves headers (line 196)', () => {
+    const wire = `{"type":3,"invocationId":"1","result":null,"headers":{"x-done":"1"}}${RS}`;
+    const msgs = p.parseMessages(wire, log);
+    expect(msgs[0]!.type).toBe(MessageType.Completion);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-done']).toBe('1');
+  });
+
+  it('StreamInvocation with headers field preserves headers (line 216)', () => {
+    const wire = `{"type":4,"invocationId":"1","target":"Foo","arguments":[],"headers":{"x-si":"ok"}}${RS}`;
+    const msgs = p.parseMessages(wire, log);
+    expect(msgs[0]!.type).toBe(MessageType.StreamInvocation);
+    expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-si']).toBe('ok');
   });
 });

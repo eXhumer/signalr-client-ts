@@ -105,10 +105,17 @@ export class LongPollingTransport implements ITransport {
   }
 
   async #pollLoop(): Promise<void> {
+    /* istanbul ignore next - #schedulePoll()'s !#running guard and
+       clearImmediate() in stop() together prevent #pollLoop from ever
+       being called once the transport has stopped; this is a
+       belt-and-suspenders defence. */
     if (!this.#running || !this.#url) return;
     try {
       await this.#poll(this.#url, /* isConnect */ false);
     } catch (err) {
+      /* istanbul ignore else - between #poll re-throwing and this catch,
+         no macrotask can run to set #running=false; the false branch is
+         a belt-and-suspenders defence against a theoretical race. */
       if (this.#running) {
         this.#logger.log(
           LogLevel.Error,

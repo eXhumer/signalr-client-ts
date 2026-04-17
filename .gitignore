@@ -3,3 +3,6 @@
 /.vscode/
 ._*
 .DS_Store
+
+# Coverage reports
+coverage/

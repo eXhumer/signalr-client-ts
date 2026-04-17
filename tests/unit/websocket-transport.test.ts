@@ -479,7 +479,60 @@ describe('WebSocketTransport', () => {
     await agent.close();
   });
 
-  // ── 12. send() rejects when the socket is not open ───────────────────────
+  // ── 12. Binary frame with onreceive null is silently ignored (L166 ?. else) ──
+
+  it('binary frame received when onreceive is null does not throw (L166 ?. else branch)', async () => {
+    const { transport } = makeTransport();
+    const clientP = srv.nextClient();
+    await transport.connect(`http://127.0.0.1:${srv.port}`, TransferFormat.Binary);
+    const client = await clientP;
+
+    // onreceive is null (not set) — the optional chain ?. must silently skip the call
+    expect(transport.onreceive).toBeNull();
+
+    client.sendBinary(Buffer.from([0xca, 0xfe, 0xba, 0xbe]));
+    // Allow time for the message event to be processed
+    await new Promise<void>((r) => setTimeout(r, 60));
+
+    // Test passes if no unhandled exception was thrown
+    await transport.stop();
+    client.destroy();
+  });
+
+  // ── 14. Constructor: omitting extraHeaders uses default {} (line 76) ─────────
+
+  it('constructed without extraHeaders arg still connects (default {} branch, line 76)', async () => {
+    // Omitting the 3rd argument exercises the `extraHeaders = {}` default parameter.
+    const logger    = new MockLogger();
+    const transport = new WebSocketTransport(
+      null,
+      logger,
+      // intentionally omit extraHeaders → default {} is used
+    );
+    const clientP = srv.nextClient();
+    await transport.connect(`http://127.0.0.1:${srv.port}`, TransferFormat.Text);
+    const client = await clientP;
+    expect(client.upgradeHeaders['authorization']).toBeUndefined();
+    await transport.stop();
+    client.destroy();
+  });
+
+  // ── 15. accessTokenFactory returns null → no Authorization header (if(token) FALSE) ──
+
+  it('accessTokenFactory returning null sends no Authorization header (if(token) FALSE branch, line 93)', async () => {
+    // Factory is non-null (so the outer `if (this.#accessTokenFactory)` is TRUE),
+    // but it returns null, exercising the `if (token)` FALSE branch.
+    const factory = async (): Promise<string | null> => null;
+    const { transport } = makeTransport({ factory });
+    const clientP = srv.nextClient();
+    await transport.connect(`http://127.0.0.1:${srv.port}`, TransferFormat.Text);
+    const client = await clientP;
+    expect(client.upgradeHeaders['authorization']).toBeUndefined();
+    await transport.stop();
+    client.destroy();
+  });
+
+  // ── 14. send() rejects when the socket is not open ───────────────────────
 
   it('send() rejects with an error when the WebSocket is not open', async () => {
     const { transport } = makeTransport();
@@ -489,7 +542,7 @@ describe('WebSocketTransport', () => {
     ).rejects.toThrow(/not open/i);
   });
 
-  // ── 13. send() after stop() rejects ──────────────────────────────────────
+  // ── 15. send() after stop() rejects ──────────────────────────────────────
 
   it('send() rejects after stop()', async () => {
     const { transport } = makeTransport();
@@ -505,7 +558,7 @@ describe('WebSocketTransport', () => {
     ).rejects.toThrow(/not open/i);
   });
 
-  // ── 14. Multiple messages in sequence ────────────────────────────────────
+  // ── 16. Multiple messages in sequence ────────────────────────────────────
 
   it('multiple server text frames are received in order', async () => {
     const { transport } = makeTransport();

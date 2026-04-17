@@ -7,13 +7,13 @@
  * Typed EventEmitter via interface declaration merging.
  *
  * Emitted events
- *   'open'             – handshake complete, ready to send/receive
- *   'message' (string) – UTF-8 text frame received
- *   'binary'  (Buffer) – binary frame received
- *   'ping'    (Buffer) – ping frame received (pong sent automatically)
- *   'pong'    (Buffer) – pong frame received
- *   'close'            – socket fully closed
- *   'error'   (Error)  – socket-level error
+ *   'open'             - handshake complete, ready to send/receive
+ *   'message' (string) - UTF-8 text frame received
+ *   'binary'  (Buffer) - binary frame received
+ *   'ping'    (Buffer) - ping frame received (pong sent automatically)
+ *   'pong'    (Buffer) - pong frame received
+ *   'close'            - socket fully closed
+ *   'error'   (Error)  - socket-level error
  */
 
 import * as net    from 'node:net';

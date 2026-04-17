@@ -1116,6 +1116,96 @@ describe('HubConnection - coverage gaps (miscellaneous)', () => {
     await closedP;
     expect(conn.state).toBe(HubConnectionState.Disconnected);
   });
+
+  // ── L659/L664/L698/L736: clean transport close paths ────────────────────
+  // When the server sends a proper WS close frame (closeGracefully) the client
+  // receives the 'close' event with no error object, so #onTransportClosed is
+  // called with err=undefined.  Combined with a policy that returns null
+  // immediately this exercises four previously-uncovered null-coalescing
+  // branches in #onTransportClosed and #doReconnect.
+
+  it('clean WS close (no error) + null-retry policy covers err-less disconnect branches', async () => {
+    const neverRetryPolicy = {
+      nextRetryDelayInMilliseconds: (): null => null,
+    };
+
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url)
+      .configureLogging(LogLevel.None)
+      .withAutomaticReconnect(neverRetryPolicy)
+      .build();
+
+    let reconnectingErr: Error | undefined = new Error('sentinel');
+    conn.onreconnecting((e) => { reconnectingErr = e; });  // e should be undefined
+
+    const closedP = new Promise<void>((resolve) => conn.onclose(() => resolve()));
+
+    const clientP = srv.nextClient();
+    await conn.start();
+    const srvCli = await clientP;
+
+    // Send a proper WS close frame → client sees clean close, err=undefined.
+    // Covers: L659 false branch ('Transport closed.' log with no err)
+    //         L664 null-coalescing (undefined ?? null → null)
+    //         L698 null-coalescing (null ?? undefined → undefined in callback)
+    //         L736 null-coalescing (null ?? undefined → undefined in #completeClose)
+    srvCli.closeGracefully();
+
+    await closedP;
+    expect(conn.state).toBe(HubConnectionState.Disconnected);
+    // onreconnecting should have been called with undefined (not an Error)
+    expect(reconnectingErr).toBeUndefined();
+  });
+
+  // ── L719: stop() during reconnect sleep exits loop via #stopping check ────
+  // The reconnect policy returns a positive delay so #doReconnect calls
+  // sleep(delay).  If stop() is called during that sleep, #stopping becomes
+  // true and the guard at L719 (if (this.#stopping) break) fires after the
+  // sleep resolves, instead of attempting another #startInternal() call.
+
+  it('stop() called during reconnect sleep triggers L719 #stopping break', async () => {
+    // Notify our test when nextRetryDelayInMilliseconds is about to be called
+    // so that we know sleep() is immediately starting.
+    let notifyDelayStarting!: () => void;
+    const delayStarting = new Promise<void>((r) => { notifyDelayStarting = r; });
+
+    const slowRetryPolicy = {
+      nextRetryDelayInMilliseconds: () => {
+        notifyDelayStarting();  // signal: sleep(200) is about to start
+        return 200;
+      },
+    };
+
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url)
+      .configureLogging(LogLevel.None)
+      .withAutomaticReconnect(slowRetryPolicy)
+      .build();
+
+    const closedP = new Promise<void>((resolve) => conn.onclose(() => resolve()));
+
+    const clientP = srv.nextClient();
+    await conn.start();
+    const srvCli = await clientP;
+
+    // Trigger disconnect to start the reconnect loop.
+    srvCli.close();
+
+    // Yield the microtask/I-O queue so that #doReconnect starts running and
+    // calls sleep(200).  The policy callback resolves delayStarting at the
+    // point where sleep() is about to be awaited; our await here resumes
+    // only after the sleep has been registered (microtasks flush after the
+    // policy function returns and before the async function suspends).
+    await delayStarting;
+
+    // Now #doReconnect is sleeping for 200 ms.  Calling stop() sets
+    // #stopping=true; after the sleep resolves, L719 fires and breaks the loop.
+    await conn.stop();
+
+    // #doReconnect finishes and calls #completeClose → onclose fires.
+    await closedP;
+    expect(conn.state).toBe(HubConnectionState.Disconnected);
+  });
 });
 
 // ─── Coverage gaps: negotiate failure scenarios ───────────────────────────────
@@ -1378,6 +1468,8 @@ describe('HubConnection - query string propagation', () => {
 
 import { CookieJar } from '../../src/index.js';
 import type { Dispatcher } from '../../src/interfaces.js';
+import { WebSocketTransport } from '../../src/transports/websocket-transport.js';
+import * as nodeCrypto from 'node:crypto';
 
 describe('HubConnection - cookie handling', () => {
   /**
@@ -1569,5 +1661,532 @@ describe('HubConnection - cookie handling', () => {
     expect(negotiateReq).toBeDefined();
     const cookieHeader = String(negotiateReq!.headers['cookie'] ?? '');
     expect(cookieHeader).toContain('auth=pre-existing-token');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Coverage gaps - hub-connection.ts
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('HubConnection - coverage gaps (hub-connection.ts)', () => {
+
+  // ── L174: default parameter Branch #1 ───────────────────────────────────
+  // `options: HubConnectionOptions = {}` - Istanbul marks two branches:
+  //   Branch #1 (TRUE):  caller omits second arg → default `{}` is used
+  //   Branch #2 (FALSE): caller supplies an explicit options object
+  //
+  // All existing tests go through HubConnectionBuilder.build() which always
+  // passes an explicit options object, so Branch #1 is never exercised.
+  // Constructing HubConnection directly without a second argument triggers it.
+
+  it('HubConnection constructed without options uses the default empty object (L174 Branch #1)', () => {
+    // Import HubConnection directly (already imported at line ~32).
+    // Passing no options exercises the `= {}` default branch.
+    const conn = new HubConnection('http://127.0.0.1:1');
+    expect(conn.state).toBe(HubConnectionState.Disconnected);
+    // No network call is made - constructing the object is enough.
+  });
+
+  // ── L262: this.#send(msg).catch function ────────────────────────────────
+  // Inside invoke(), after registering the callback and calling #send():
+  //
+  //   this.#send(msg).catch((err: Error) => {
+  //     this.#callbacks.delete(id);   // removes the pending entry
+  //     reject(err);                  // rejects the invoke() promise
+  //   });
+  //
+  // To reach this catch handler the transport's send() must reject while the
+  // connection is in the Connected state.  We briefly patch
+  // WebSocketTransport.prototype.send on the prototype so the next call
+  // rejects, then restore it immediately after.
+
+  it('invoke() .catch handler fires when transport.send() rejects (L262)', async () => {
+    const srv2 = await startSignalRServer();
+    try {
+      const conn2 = new HubConnectionBuilder()
+        .withUrl(srv2.url)
+        .configureLogging(LogLevel.None)
+        .build();
+      const clientP = srv2.nextClient();
+      await conn2.start();
+      await clientP;
+
+      // Patch prototype so the very next send() rejects.
+      const sendErr  = new Error('transport send failed');
+      const origSend = WebSocketTransport.prototype.send;
+      WebSocketTransport.prototype.send = (): Promise<void> => Promise.reject(sendErr);
+
+      try {
+        await expect(
+          conn2.invoke('AnyMethod')
+        ).rejects.toThrow('transport send failed');
+      } finally {
+        WebSocketTransport.prototype.send = origSend;
+      }
+
+      await conn2.stop();
+    } finally {
+      await srv2.close();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Coverage gaps II - hub-connection.ts deeper code paths
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Minimal WebSocket server-side text-frame encoder (no masking).
+// Used by tests that spin up their own HTTP+WS server.
+const WS_GUID_HEX = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+function wsTextFrame(text: string): Buffer {
+  const payload = Buffer.from(text, 'utf8');
+  const len     = payload.length;
+  if (len < 126) {
+    return Buffer.concat([Buffer.from([0x81, len]), payload]);
+  }
+  const h = Buffer.allocUnsafe(4);
+  h[0] = 0x81; h[1] = 126; h.writeUInt16BE(len, 2);
+  return Buffer.concat([h, payload]);
+}
+
+// Small helper: spin up a plain HTTP server that accepts WebSocket upgrades,
+// sends the WS 101 handshake and then hands the socket to `onUpgrade`.
+async function makeWsServer(
+  onRequest: (req: http.IncomingMessage, res: http.ServerResponse) => void,
+  onUpgrade: (socket: net.Socket) => void,
+): Promise<{ url: string; stop: () => Promise<void> }> {
+  const s = http.createServer(onRequest);
+  s.on('upgrade', (req: http.IncomingMessage, socket: net.Socket) => {
+    const key    = req.headers['sec-websocket-key'] as string;
+    const accept = nodeCrypto.createHash('sha1').update(key + WS_GUID_HEX).digest('base64');
+    socket.write(
+      `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
+    // The socket may be in a non-flowing state after the HTTP server passes it
+    // to the upgrade handler.  resume() ensures 'data' events fire properly.
+    socket.resume();
+    onUpgrade(socket);
+  });
+  await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+  const { port } = s.address() as net.AddressInfo;
+  return {
+    url:  `http://127.0.0.1:${port}/hub`,
+    stop: () => new Promise<void>((r) => { s.closeAllConnections(); s.close(() => r()); }),
+  };
+}
+
+// Standard negotiate-only HTTP server (no WebSocket support).
+async function makeNegotiateSrv(
+  transports: { transport: string; transferFormats: string[] }[],
+  onRequest?: (req: http.IncomingMessage, res: http.ServerResponse) => boolean,
+): Promise<{ url: string; stop: () => Promise<void> }> {
+  const s = http.createServer((req, res) => {
+    // Let callers intercept first; return true to skip default behaviour.
+    if (onRequest?.(req, res)) return;
+    if (req.url?.includes('/negotiate')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        negotiateVersion: 1,
+        connectionId:    'test-cid',
+        connectionToken: 'test-tok',
+        availableTransports: transports,
+      }));
+    } else {
+      res.writeHead(503); res.end();
+    }
+  });
+  await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+  const { port } = s.address() as net.AddressInfo;
+  return {
+    url:  `http://127.0.0.1:${port}/hub`,
+    stop: () => new Promise<void>((r) => { s.closeAllConnections(); s.close(() => r()); }),
+  };
+}
+
+describe('HubConnection - coverage gaps II (hub-connection.ts deeper paths)', () => {
+  let srv: SignalRTestServer;
+
+  beforeAll(async ()  => { srv = await startSignalRServer(); });
+  afterAll(async ()   => { await srv.close(); });
+  beforeEach(()       => { srv.requests.length = 0; });
+
+  // ── L615: server sends a Ping (Type 6) ──────────────────────────────────
+
+  it('server Ping (type 6) is silently accepted - connection stays Connected (L615)', async () => {
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url)
+      .configureLogging(LogLevel.None)
+      .build();
+    const clientP = srv.nextClient();
+    await conn.start();
+    const srvCli = await clientP;
+
+    srvCli.sendMessage({ type: MessageType.Ping });
+    await new Promise<void>((r) => setTimeout(r, 30));
+
+    expect(conn.state).toBe(HubConnectionState.Connected);
+    await conn.stop();
+  });
+
+  // ── L639-640: unknown message type hits the default switch case ──────────
+  // MessageType 4 (StreamInvocation) is parsed to a non-null HubMessage by the
+  // JSON protocol but has no matching case in hub-connection's switch → default.
+
+  it('StreamInvocation received from server hits the default switch branch (L639-640)', async () => {
+    const logger = new MockLogger();
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url)
+      .configureLogging(logger)
+      .build();
+    const clientP = srv.nextClient();
+    await conn.start();
+    const srvCli = await clientP;
+
+    // type 4 = StreamInvocation - valid JSON-protocol message, no hub-connection case
+    srvCli.sendMessage({ type: 4, invocationId: '1', target: 'Counter', arguments: [] });
+    await new Promise<void>((r) => setTimeout(r, 30));
+
+    expect(logger.hasMessage('Unknown')).toBeTruthy();
+    await conn.stop();
+  });
+
+  // ── L658: transport closed unexpectedly, no reconnect policy ────────────
+
+  it('server socket destruction causes onclose to fire (no reconnect policy) (L658)', async () => {
+    const conn    = new HubConnectionBuilder()
+      .withUrl(srv.url)
+      .configureLogging(LogLevel.None)
+      .build();
+    const closedP = new Promise<void>((r) => conn.onclose(() => r()));
+
+    const clientP = srv.nextClient();
+    await conn.start();
+    const srvCli  = await clientP;
+
+    srvCli.close(); // destroy server socket → WebSocket close event on client
+    await closedP;
+
+    expect(conn.state).toBe(HubConnectionState.Disconnected);
+  });
+
+  // ── L374-375, L492-493: skipNegotiation + WebSockets path ───────────────
+
+  it('skipNegotiation+WebSockets connects directly without a negotiate round-trip (L374-375, L492-493)', async () => {
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url, { skipNegotiation: true, transport: HttpTransportType.WebSockets })
+      .configureLogging(LogLevel.None)
+      .build();
+    const clientP = srv.nextClient();
+    await conn.start();
+    await clientP;
+
+    expect(conn.state).toBe(HubConnectionState.Connected);
+    // No negotiate request should have been made
+    expect(srv.requests.every((r) => !r.url.includes('/negotiate'))).toBeTruthy();
+    await conn.stop();
+  });
+
+  // ── L438-439: accessTokenFactory adds Authorization header to negotiate ──
+
+  it('accessTokenFactory token is forwarded as Bearer Authorization in negotiate (L438-439)', async () => {
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url, {
+        accessTokenFactory: () => Promise.resolve('bearer-token-xyz'),
+      })
+      .configureLogging(LogLevel.None)
+      .build();
+    const clientP = srv.nextClient();
+    await conn.start();
+    await clientP;
+
+    const negReq = srv.requests.find((r) => r.url.includes('/negotiate'));
+    expect(negReq?.headers['authorization']).toBe('Bearer bearer-token-xyz');
+    await conn.stop();
+  });
+
+  // ── L314-315: stream() .catch fires when transport.send() rejects ────────
+
+  it("stream() subscriber.error fires when transport.send() rejects (L314-315)", async () => {
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url)
+      .configureLogging(LogLevel.None)
+      .build();
+    const clientP = srv.nextClient();
+    await conn.start();
+    await clientP;
+
+    const sendErr  = new Error('stream-send-rejected');
+    const origSend = WebSocketTransport.prototype.send;
+    WebSocketTransport.prototype.send = (): Promise<void> => Promise.reject(sendErr);
+
+    const erroredP = new Promise<Error>((_, reject) => {
+      conn.stream<number>('Counter').subscribe({ error: reject });
+    });
+
+    WebSocketTransport.prototype.send = origSend;
+    await expect(erroredP).rejects.toThrow('stream-send-rejected');
+    await conn.stop().catch(() => { /* connection may already be closing */ });
+  });
+
+  // ── L559-561: parseMessages throws on invalid message ───────────────────
+  // Sending a message whose `type` field is a string (not a number) causes
+  // JsonHubProtocol.#coerce → parseMessages to throw, which hub-connection
+  // catches at L557-561 and closes the connection.
+
+  it('server message with non-numeric type field closes the connection (L559-561)', async () => {
+    const conn    = new HubConnectionBuilder()
+      .withUrl(srv.url)
+      .configureLogging(LogLevel.None)
+      .build();
+    const closedP = new Promise<void>((r) => conn.onclose(() => r()));
+
+    const clientP = srv.nextClient();
+    await conn.start();
+    const srvCli  = await clientP;
+
+    srvCli.sendMessage({ type: 'not-a-number' }); // #coerce throws → L559-561
+    await closedP;
+
+    expect(conn.state).toBe(HubConnectionState.Disconnected);
+  });
+
+  // ── L740: ping failure is logged as a warning ────────────────────────────
+
+  it('ping send failure is logged as a warning (L740)', async () => {
+    const logger = new MockLogger();
+    const conn   = new HubConnectionBuilder()
+      .withUrl(srv.url, { keepAliveIntervalInMilliseconds: 50 })
+      .configureLogging(logger)
+      .build();
+    const clientP = srv.nextClient();
+    await conn.start();
+    await clientP;
+
+    const origSend = WebSocketTransport.prototype.send;
+    WebSocketTransport.prototype.send = (): Promise<void> =>
+      Promise.reject(new Error('ping-send-failed'));
+
+    await new Promise<void>((r) => setTimeout(r, 120)); // wait for ≥1 ping tick
+
+    WebSocketTransport.prototype.send = origSend;
+    expect(logger.hasMessage('Ping failed')).toBeTruthy();
+    await conn.stop().catch(() => {});
+  });
+
+  // ── L722-724: reconnect attempt failure ──────────────────────────────────
+  // Uses its own server so it can be closed while the connection is live,
+  // forcing the reconnect attempt (which requires a live server) to fail.
+
+  it('failed reconnect attempt logs a warning (L722-724)', async () => {
+    const srv2   = await startSignalRServer();
+    const logger = new MockLogger();
+    let   callCount = 0;
+    // Return 0ms on the first retry attempt, then null (stop retrying).
+    const oneRetryPolicy = {
+      nextRetryDelayInMilliseconds: (): number | null => callCount++ === 0 ? 0 : null,
+    };
+
+    const conn    = new HubConnectionBuilder()
+      .withUrl(srv2.url)
+      .configureLogging(logger)
+      .withAutomaticReconnect(oneRetryPolicy)
+      .build();
+    const closedP = new Promise<void>((r) => conn.onclose(() => r()));
+
+    const clientP = srv2.nextClient();
+    await conn.start();
+    await clientP;
+
+    // Close the server so the reconnect attempt cannot establish a new connection.
+    // srv2.close() destroys sockets → triggers client disconnect → #doReconnect
+    // calls #startInternal() after 0 ms delay → ECONNREFUSED → L722-724 fires.
+    await srv2.close();
+
+    await closedP;
+    expect(logger.hasMessage('Reconnect attempt')).toBeTruthy();
+    expect(logger.hasMessage('failed')).toBeTruthy();
+  });
+
+  // ── L544-549: handshake parse error ─────────────────────────────────────
+  // Configure the shared test server to send an error handshake response.
+  // `parseHandshakeResponse` throws when it sees the `error` field, and
+  // hub-connection catches it at L544-549.
+
+  it('server handshake error causes start() to reject (L544-549)', async () => {
+    // Ask the server to send an error handshake instead of the normal `{}\x1e`.
+    srv.handshakeResponse = `{"error":"protocol not supported"}\x1e`;
+
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url)
+      .configureLogging(LogLevel.None)
+      .build();
+
+    await expect(conn.start()).rejects.toThrow(/protocol not supported/);
+    // srv.handshakeResponse is reset to '' by the server after each connection.
+  });
+
+  // ── L385-386, L418: negotiate redirect with accessToken ──────────────────
+  // A redirect response that carries an `accessToken` field causes
+  // #overrideAccessToken (L418) to be called so that subsequent negotiate
+  // requests use the new token (L385-386).
+
+  it('negotiate redirect with accessToken field overrides the access-token factory (L385-386, L418)', async () => {
+    // A server that returns one redirect pointing to the shared test server.
+    const redirectSrv = await (async (): Promise<{ url: string; stop: () => Promise<void> }> => {
+      const s = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ url: srv.url, accessToken: 'redirected-bearer-456' }));
+      });
+      await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+      const { port } = s.address() as net.AddressInfo;
+      return {
+        url:  `http://127.0.0.1:${port}/hub`,
+        stop: () => new Promise<void>((r) => { s.closeAllConnections(); s.close(() => r()); }),
+      };
+    })();
+
+    const conn    = new HubConnectionBuilder()
+      .withUrl(redirectSrv.url)
+      .configureLogging(LogLevel.None)
+      .build();
+    const clientP = srv.nextClient();
+
+    await conn.start();
+    await clientP;
+
+    // The second negotiate went to srv (real server) carrying the redirected token.
+    const negReq = srv.requests.find((r) => r.url.includes('/negotiate'));
+    expect(negReq?.headers['authorization']).toBe('Bearer redirected-bearer-456');
+
+    await conn.stop();
+    await redirectSrv.stop();
+  });
+
+  // ── L482-489: all transports fail → UnsupportedTransportError ───────────
+  // A server that offers WebSockets in negotiate but rejects every WebSocket
+  // upgrade causes #selectTransport to log a warning at L482, then throw
+  // UnsupportedTransportError at L486-489.
+
+  it('WebSocket upgrade failure causes UnsupportedTransportError (L482-489)', async () => {
+    const s = http.createServer((req, res) => {
+      if (req.url?.includes('/negotiate')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          negotiateVersion: 1, connectionId: 'ws-fail', connectionToken: 'wf-tok',
+          availableTransports: [{ transport: 'WebSockets', transferFormats: ['Text'] }],
+        }));
+      } else { res.writeHead(404); res.end(); }
+    });
+    // Reject every WebSocket upgrade to make transport.connect() fail.
+    s.on('upgrade', (_req: http.IncomingMessage, socket: net.Socket) => {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+    });
+    await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+    const { port } = s.address() as net.AddressInfo;
+    const failUrl  = `http://127.0.0.1:${port}/hub`;
+
+    const conn = new HubConnectionBuilder()
+      .withUrl(failUrl)
+      .configureLogging(LogLevel.None)
+      .build();
+
+    await expect(conn.start()).rejects.toThrow(/Unable to connect/);
+
+    await new Promise<void>((r) => { s.closeAllConnections(); s.close(() => r()); });
+  });
+
+  // ── L503: ServerSentEvents transport creation ────────────────────────────
+
+  it('SSE transport is instantiated when negotiate offers only ServerSentEvents (L503)', async () => {
+    const sseSrv = await makeNegotiateSrv(
+      [{ transport: 'ServerSentEvents', transferFormats: ['Text'] }],
+    );
+    const conn = new HubConnectionBuilder()
+      .withUrl(sseSrv.url, { transport: HttpTransportType.ServerSentEvents })
+      .configureLogging(LogLevel.None)
+      .build();
+
+    // #createTransport(ServerSentEvents) fires (L503) then connect() rejects (503 server).
+    await expect(conn.start()).rejects.toThrow();
+    await sseSrv.stop();
+  });
+
+  // ── L505: LongPolling transport creation ─────────────────────────────────
+
+  it('LongPolling transport is instantiated when negotiate offers only LongPolling (L505)', async () => {
+    const lpSrv = await makeNegotiateSrv(
+      [{ transport: 'LongPolling', transferFormats: ['Text'] }],
+    );
+    const conn = new HubConnectionBuilder()
+      .withUrl(lpSrv.url, { transport: HttpTransportType.LongPolling })
+      .configureLogging(LogLevel.None)
+      .build();
+
+    // #createTransport(LongPolling) fires (L505) then connect() rejects (503 server).
+    await expect(conn.start()).rejects.toThrow();
+    await lpSrv.stop();
+  });
+
+
+  // ── L521: handshake timer fires when server never sends handshake JSON ─────
+  // Uses the new handshakeTimeoutInMilliseconds option (100 ms) so the test
+  // does not wait 15 s for the hard-coded default to expire.
+  //
+  // srv.hangHandshake instructs startSignalRServer to accept the WS upgrade
+  // and receive the client's SignalR handshake request, but deliberately
+  // omit the handshake response.  The client's timer (L528-530) fires after
+  // 100 ms and rejects start() with "Server timeout: no handshake response".
+
+  it('start() rejects when server completes WS upgrade but never sends handshake (L521)', async () => {
+    srv.hangHandshake = true;
+
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url, { handshakeTimeoutInMilliseconds: 100 })
+      .configureLogging(LogLevel.None)
+      .build();
+
+    await expect(conn.start()).rejects.toThrow(/Server timeout.*handshake/i);
+  });
+
+  // ── L439: accessTokenFactory returning null skips Authorization header ────
+  // When the factory returns null the `if (token)` branch is false → no header.
+
+  it('accessTokenFactory returning null does not add an Authorization header (L439)', async () => {
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url, { accessTokenFactory: () => Promise.resolve(null) })
+      .configureLogging(LogLevel.None)
+      .build();
+
+    const clientP = srv.nextClient();
+    await conn.start();
+    await clientP;
+
+    const negReq = srv.requests.find((r) => r.url.includes('/negotiate'));
+    expect(negReq?.headers['authorization']).toBeUndefined();
+    await conn.stop();
+  });
+
+  // ── L589: StreamItem with unknown invocationId is silently ignored ─────────
+  // When #streamCbs has no entry for the incoming invocationId the `if (!sc)`
+  // guard at L589 breaks out of the switch case without error.
+
+  it('StreamItem for an unrecognised invocationId is silently ignored (L589)', async () => {
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url)
+      .configureLogging(LogLevel.None)
+      .build();
+
+    const clientP = srv.nextClient();
+    await conn.start();
+    const srvCli = await clientP;
+
+    // No stream subscription registered → #streamCbs is empty → if (!sc) fires.
+    srvCli.sendMessage({ type: MessageType.StreamItem, invocationId: 'no-such-id', item: 42 });
+    await new Promise<void>((r) => setTimeout(r, 30));
+
+    expect(conn.state).toBe(HubConnectionState.Connected);
+    await conn.stop();
   });
 });

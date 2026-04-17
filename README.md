@@ -1,10 +1,15 @@
 # @exhumer/signalr-client
 
+[![CI](https://github.com/eXhumer/signalr-client-ts/actions/workflows/ci.yml/badge.svg)](https://github.com/eXhumer/signalr-client-ts/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/eXhumer/signalr-client-ts/branch/main/graph/badge.svg)](https://codecov.io/gh/eXhumer/signalr-client-ts)
+[![npm](https://img.shields.io/npm/v/@exhumer/signalr-client)](https://www.npmjs.com/package/@exhumer/signalr-client)
+
+
 ASP.NET Core SignalR client for Node.js. HTTP and WebSocket layers are backed entirely by [undici](https://github.com/nodejs/undici) - no `node-fetch`, no `ws`, no browser shims required.
 
 ## Requirements
 
-- Node.js ≥ 20
+- Node.js ≥ 22
 - TypeScript ≥ 5.9 (for consumers using types)
 
 ## Installation
