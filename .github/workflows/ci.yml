@@ -36,8 +36,19 @@ jobs:
       - name: Upload coverage to Codecov
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-        if: matrix.node-version == 22 && env.CODECOV_TOKEN != ''
-        uses: codecov/codecov-action@v5
+        if: matrix.node-version == 22 && env.CODECOV_TOKEN != '' && !cancelled()
+        uses: codecov/codecov-action@v6
         with:
+          report_type: 'coverage'
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/lcov.info
+
+      - name: Upload test results to Codecov
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        if: matrix.node-version == 22 && env.CODECOV_TOKEN != '' && !cancelled()
+        uses: codecov/codecov-action@v6
+        with:
+          report_type: 'test_results'
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./test-report.junit.xml

@@ -6,3 +6,4 @@
 
 # Coverage reports
 coverage/
+test-report.junit.xml
