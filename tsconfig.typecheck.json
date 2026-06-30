@@ -11,11 +11,10 @@
     // CookieAgent.  Pinning to the CTS declaration file makes both contexts
     // resolve the same declaration, eliminating the conflict.
     //
-    // This override lives here rather than in tsconfig.json so that tsup's
-    // esbuild JS bundler, which reads tsconfig.json for module resolution,
-    // never sees the redirect (esbuild would follow it to the .d.cts file and
-    // try to bundle it as JS).  The equivalent override for tsup's DTS worker
-    // is declared in tsup.config.ts under dts.compilerOptions.paths.
+    // This override lives here rather than in tsconfig.json so that tsdown's
+    // JS bundler, which reads tsconfig.json for module resolution, never sees
+    // the redirect. The equivalent override for tsdown's declaration bundler
+    // is declared in tsdown.config.ts under dts.compilerOptions.paths.
     "paths": {
       "tough-cookie": ["./node_modules/tough-cookie/dist/index.d.cts"]
     }
