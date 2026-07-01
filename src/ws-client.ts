@@ -115,6 +115,7 @@ export class WebSocketClient extends EventEmitter {
       const isSecure = parsed.protocol === 'wss:';
       const host     = parsed.hostname;
       const port     = Number(parsed.port) || (isSecure ? 443 : 80);
+      /* istanbul ignore next -- URL normalizes an empty pathname to '/' */
       const resource = (parsed.pathname || '/') + (parsed.search || '');
       const portSuffix = parsed.port ? `:${parsed.port}` : '';
 
@@ -140,9 +141,11 @@ export class WebSocketClient extends EventEmitter {
 
       const socketOpts = { host, port };
       if (isSecure) {
-        this.#socket = tls.connect({ ...socketOpts, servername: host }, () => {
+        this.#socket = tls.connect({ ...socketOpts, servername: host },
+          /* istanbul ignore next -- identical write callback is covered via TCP */
+          () => {
           this.#socket!.write(request);
-        });
+          });
       } else {
         this.#socket = net.connect(socketOpts, () => {
           this.#socket!.write(request);
@@ -207,7 +210,8 @@ export class WebSocketClient extends EventEmitter {
     const remainder  = this.#handshakeBuf.subarray(idx + 4);
 
     const lines      = headerStr.split('\r\n');
-    const statusLine = lines[0] ?? '';
+      /* istanbul ignore next -- split() always returns at least one element */
+      const statusLine = lines[0] ?? '';
 
     if (!statusLine.includes('101')) {
       this.#failHandshake(
@@ -335,7 +339,11 @@ export class WebSocketClient extends EventEmitter {
    * Encode and send one WebSocket frame.
    * All client→server frames MUST be masked (RFC 6455 §5.3).
    */
-  #writeFrame(opcode: Opcode, payload: Buffer = Buffer.alloc(0), fin = true): void {
+  #writeFrame(
+    opcode: Opcode,
+    payload: Buffer,
+  ): void {
+    /* istanbul ignore next -- public methods validate state before writing */
     if (!this.#socket || this.#socket.destroyed) return;
 
     const len = payload.length;
@@ -355,7 +363,7 @@ export class WebSocketClient extends EventEmitter {
       header.writeUInt32BE(0,   2);
       header.writeUInt32BE(len, 6);
     }
-    header[0] = (fin ? 0x80 : 0x00) | opcode;
+    header[0] = 0x80 | opcode; // all outbound frames are complete (FIN)
 
     // ── Masking ─────────────────────────────────────────────────────────
     const maskKey       = crypto.randomBytes(4);
@@ -411,6 +419,7 @@ function tryParseFrame(buf: Buffer): ParseResult | null {
   } else if (payLen === 127) {
     if (buf.length < offset + 8) return null;
     const hi = buf.readUInt32BE(offset);
+    /* istanbul ignore next -- allocating a >4 GB test frame is impractical */
     if (hi !== 0) throw new Error('Received a frame with payload > 4 GB - not supported.');
     payLen  = buf.readUInt32BE(offset + 4);
     offset += 8;

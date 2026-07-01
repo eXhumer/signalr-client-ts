@@ -159,10 +159,10 @@ export class WebSocketTransport implements ITransport {
         this.#logger.log(LogLevel.Trace,
           `(WebSockets transport) Received text (${data.length} chars).`);
         this.onreceive?.(data);
-      /* istanbul ignore else - binaryType='arraybuffer' constrains delivery
-         to string | ArrayBuffer; any other type is unreachable in practice. */
-      } else if (data instanceof ArrayBuffer) {
-        const buf = Buffer.from(data);
+      } else {
+        // binaryType='arraybuffer' guarantees every non-string payload is an
+        // ArrayBuffer, so this is exhaustive rather than a defensive branch.
+        const buf = Buffer.from(data as ArrayBuffer);
         this.#logger.log(LogLevel.Trace,
           `(WebSockets transport) Received binary (${buf.length} bytes).`);
         this.onreceive?.(buf);

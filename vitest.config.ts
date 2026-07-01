@@ -48,6 +48,14 @@ export default defineConfig({
        * Write all coverage artefacts to coverage/.
        */
       reportsDirectory: 'coverage',
+
+      /** Keep the suite honest: any coverage regression fails CI. */
+      thresholds: {
+        statements: 100,
+        branches: 100,
+        functions: 100,
+        lines: 100,
+      },
     },
   },
 

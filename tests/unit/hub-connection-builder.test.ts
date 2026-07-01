@@ -4,7 +4,7 @@
  * Tests the fluent builder API, validation, and DefaultReconnectPolicy.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, afterEach, expect } from 'vitest';
 
 import { HubConnectionBuilder, DefaultReconnectPolicy } from '../../src/hub-connection-builder.js';
 import { HubConnection }        from '../../src/hub-connection.js';
@@ -18,6 +18,9 @@ import {
   PipelineHttpClient,
   DispatchHttpClient,
 } from '../../src/http-client.js';
+import { closeTrackedDispatchers, trackDispatcher } from '../helpers/dispatcher-tracker.js';
+
+afterEach(closeTrackedDispatchers);
 
 // ─── Builder basics ───────────────────────────────────────────────────────────
 
@@ -212,32 +215,29 @@ describe('DefaultReconnectPolicy', () => {
 
 describe('HubConnectionBuilder.withDispatcher()', () => {
   it('is chainable (returns this)', () => {
-    const agent   = new Agent();
+    const agent   = trackDispatcher(new Agent());
     const builder = new HubConnectionBuilder().withUrl('http://localhost/hub');
     expect(builder.withDispatcher(agent)).toBe(builder);
-    void agent.close();
   });
 
   it('does not throw when a valid Dispatcher is provided', () => {
-    const agent = new Agent({ connections: 4 });
+    const agent = trackDispatcher(new Agent({ connections: 4 }));
     expect(() => {
       new HubConnectionBuilder()
         .withUrl('http://localhost/hub')
         .withDispatcher(agent)
         .build();
     }).not.toThrow();
-    void agent.close();
   });
 
   it('produces a HubConnection instance when combined with other options', () => {
-    const agent = new Agent();
+    const agent = trackDispatcher(new Agent());
     const conn  = new HubConnectionBuilder()
       .withUrl('http://localhost/hub')
       .withDispatcher(agent)
       .configureLogging(LogLevel.None)
       .build();
     expect(conn instanceof HubConnection).toBeTruthy();
-    void agent.close();
   });
 });
 
@@ -295,7 +295,7 @@ describe('HubConnectionBuilder.withHttpClient()', () => {
   });
 
   it('can be combined with withDispatcher()', () => {
-    const agent = new Agent();
+    const agent = trackDispatcher(new Agent());
     expect(() => {
       new HubConnectionBuilder()
         .withUrl('http://localhost/hub')
@@ -303,7 +303,6 @@ describe('HubConnectionBuilder.withHttpClient()', () => {
         .withHttpClient(new FetchHttpClient({ dispatcher: agent }))
         .build();
     }).not.toThrow();
-    void agent.close();
   });
 });
 

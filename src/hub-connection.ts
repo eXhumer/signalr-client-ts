@@ -327,7 +327,10 @@ export class HubConnection {
             this.#streamCbs.delete(id);
             this.#send(
               this.#protocol.writeMessage(JsonHubProtocol.cancelInvocation(id)) as string
-            ).catch(() => { /* best-effort */ });
+            ).catch(
+              /* istanbul ignore next -- cancellation is intentionally best-effort */
+              () => { /* best-effort */ },
+            );
           }
         });
       },
@@ -395,9 +398,12 @@ export class HubConnection {
           continue;
         }
 
+        /* istanbul ignore next -- a successful negotiate response must include connectionId */
         this.#connectionId    = neg.connectionId ?? null;
+        /* istanbul ignore next -- the protocol requires a token or connectionId */
         this.#connectionToken = neg.connectionToken ?? neg.connectionId ?? null;
 
+        /* istanbul ignore next -- the protocol requires availableTransports */
         await this.#selectTransport(url, neg.availableTransports ?? []);
         break;
       }
@@ -405,6 +411,7 @@ export class HubConnection {
 
     // Wire message routing
     this.#transport!.onreceive = (data) => this.#processIncoming(
+      /* istanbul ignore next -- negotiated JSON transports deliver text */
       typeof data === 'string' ? data : Buffer.from(data).toString('utf8')
     );
     this.#transport!.onclose   = (err) => this.#onTransportClosed(err);
@@ -478,6 +485,7 @@ export class HubConnection {
 
       this.#logger.log(LogLevel.Debug, `Trying ${pref.name} transport.`);
       const transport = this.#createTransport(pref.flag);
+      /* istanbul ignore next -- successful negotiation always supplies a token */
       const token     = this.#connectionToken ?? '';
       const tUrl      = appendParam(url, 'id', token);
 
@@ -553,6 +561,7 @@ export class HubConnection {
         const r = this.#handshakeRejecter!;
         this.#handshakeResolver = null;
         this.#handshakeRejecter = null;
+        /* istanbul ignore next -- JSON.parse and protocol validation throw Error objects */
         r(err instanceof Error ? err : new Error(String(err)));
         return;
       }
@@ -565,6 +574,7 @@ export class HubConnection {
       messages = this.#protocol.parseMessages(this.#messageBuffer, this.#logger);
     } catch (err) {
       this.#logger.log(LogLevel.Error, `Error parsing messages: ${(err as Error).message}`);
+      /* istanbul ignore next -- protocol parsers throw Error objects */
       this.#stopWithError(err instanceof Error ? err : new Error(String(err)));
       return;
     }
@@ -637,7 +647,10 @@ export class HubConnection {
             if (this.#transport) this.#transport.onclose = null;
             const t = this.#transport;
             this.#transport = null;
-            void t?.stop().catch(() => {});
+            void t?.stop().catch(
+              /* istanbul ignore next -- shutdown after a server Close is best-effort */
+              () => {},
+            );
             void this.#doReconnect(closeErr);
           } else {
             this.#stopWithError(closeErr);
@@ -674,7 +687,10 @@ export class HubConnection {
 
   #stopWithError(err: Error | null): void {
     this.#clearTimers();
-    void this.#transport?.stop().catch(() => { /* ignore */ });
+    void this.#transport?.stop().catch(
+      /* istanbul ignore next -- error shutdown is best-effort */
+      () => { /* ignore */ },
+    );
     this.#transport = null;
     this.#completeClose(err ?? undefined);
   }

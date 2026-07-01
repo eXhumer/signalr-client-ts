@@ -38,7 +38,7 @@
  * 11.  Custom Agent dispatcher accepted and connection succeeds
  */
 
-import { describe, it, beforeAll, afterAll, expect } from 'vitest';
+import { describe, it, beforeAll, afterAll, afterEach, expect } from 'vitest';
 import * as http   from 'node:http';
 import * as net    from 'node:net';
 import * as crypto from 'node:crypto';
@@ -47,6 +47,9 @@ import { Agent, type Dispatcher } from 'undici';
 import { WebSocketTransport } from '../../src/transports/websocket-transport.js';
 import { TransferFormat }     from '../../src/constants.js';
 import { MockLogger }         from '../helpers/mock-logger.js';
+import { closeTrackedDispatchers, trackDispatcher } from '../helpers/dispatcher-tracker.js';
+
+afterEach(closeTrackedDispatchers);
 
 // ─── RFC 6455 constants ───────────────────────────────────────────────────────
 
@@ -250,7 +253,7 @@ function makeTransport(opts: {
     opts.headers  ?? {},
     // Use a fresh Agent per transport so connection-pool state from one test
     // cannot contaminate the next test's WebSocket handshake.
-    opts.dispatcher ?? new Agent(),
+    opts.dispatcher ?? trackDispatcher(new Agent()),
   );
   return { transport, logger };
 }
@@ -278,8 +281,7 @@ describe('WebSocketTransport', () => {
     await transport.connect(`http://127.0.0.1:${srv.port}`, TransferFormat.Text);
 
     const client = await clientP;
-    // If we reach here without throwing, the handshake completed.
-    expect(true).toBeTruthy();
+    expect(client.upgradeHeaders['upgrade']).toBe('websocket');
 
     await transport.stop();
     client.destroy();
@@ -466,7 +468,7 @@ describe('WebSocketTransport', () => {
   // ── 11. Custom Agent dispatcher is accepted ───────────────────────────────
 
   it('withDispatcher(Agent) - connection succeeds using the custom dispatcher', async () => {
-    const agent = new Agent({ connections: 2 });
+    const agent = trackDispatcher(new Agent({ connections: 2 }));
     const { transport } = makeTransport({ dispatcher: agent });
     const clientP       = srv.nextClient();
 
@@ -476,7 +478,6 @@ describe('WebSocketTransport', () => {
     const client = await clientP;
     await transport.stop();
     client.destroy();
-    await agent.close();
   });
 
   // ── 12. Binary frame with onreceive null is silently ignored (L166 ?. else) ──

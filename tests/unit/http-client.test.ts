@@ -15,7 +15,7 @@
  *   DispatchHttpClient  - Dispatcher#dispatch()  (default / HttpClient alias)
  */
 
-import { describe, it, beforeAll, afterAll, expect } from 'vitest';
+import { describe, it, beforeAll, afterAll, beforeEach, afterEach, expect } from 'vitest';
 import * as http from 'node:http';
 import * as net  from 'node:net';
 import { Agent } from 'undici';
@@ -29,6 +29,9 @@ import {
   HttpClient,          // alias for DispatchHttpClient
 } from '../../src/http-client.js';
 import type { IHttpClient } from '../../src/interfaces.js';
+import { closeTrackedDispatchers, trackDispatcher } from '../helpers/dispatcher-tracker.js';
+
+afterEach(closeTrackedDispatchers);
 
 // ─── In-process test server ───────────────────────────────────────────────────
 
@@ -100,10 +103,8 @@ function registerCommonTests(label: string, factory: (srv: TestServer) => IHttpC
     let srv:    TestServer;
     let client: IHttpClient;
 
-    beforeAll(async () => {
-      srv    = await createTestServer();
-      client = factory(srv);
-    });
+    beforeAll(async () => { srv = await createTestServer(); });
+    beforeEach(() => { client = factory(srv); });
 
     afterAll(async () => { await srv.close(); });
 
@@ -224,31 +225,31 @@ function registerCommonTests(label: string, factory: (srv: TestServer) => IHttpC
         result.body.on('close', resolve);
         result.body.on('error', resolve); // destroyed streams emit error
       });
-      // We don't assert exact data because some bytes may arrive before abort
-      expect(true, 'abort() completed without throwing').toBeTruthy();
+      // Some bytes may arrive before abort, but the stream must be torn down.
+      expect(result.body.destroyed).toBe(true);
     });
   });
 }
 
 // Register the same tests for all five implementations
 registerCommonTests('RequestHttpClient (undici.request)', (_srv) =>
-  new RequestHttpClient({ timeout: 5000 })
+  new RequestHttpClient({ timeout: 5000, dispatcher: trackDispatcher(new Agent()) })
 );
 
 registerCommonTests('FetchHttpClient (undici.fetch)', (_srv) =>
-  new FetchHttpClient({ timeout: 5000 })
+  new FetchHttpClient({ timeout: 5000, dispatcher: trackDispatcher(new Agent()) })
 );
 
 registerCommonTests('StreamHttpClient (undici.stream)', (_srv) =>
-  new StreamHttpClient({ timeout: 5000 })
+  new StreamHttpClient({ timeout: 5000, dispatcher: trackDispatcher(new Agent()) })
 );
 
 registerCommonTests('PipelineHttpClient (undici.pipeline)', (_srv) =>
-  new PipelineHttpClient({ timeout: 5000 })
+  new PipelineHttpClient({ timeout: 5000, dispatcher: trackDispatcher(new Agent()) })
 );
 
 registerCommonTests('DispatchHttpClient (Dispatcher#dispatch)', (_srv) =>
-  new DispatchHttpClient({ timeout: 5000 })
+  new DispatchHttpClient({ timeout: 5000, dispatcher: trackDispatcher(new Agent()) })
 );
 
 // ─── HttpClient alias ─────────────────────────────────────────────────────────
@@ -277,14 +278,14 @@ describe('HttpClientOptions.headers (session-level defaults)', () => {
   // Test with RequestHttpClient as representative; other clients share the same
   // BaseUndiciClient header-merging logic.
   it('sends default headers', async () => {
-    const c   = new RequestHttpClient({ headers: { 'X-Test': 'from-default' } });
+    const c   = new RequestHttpClient({ headers: { 'X-Test': 'from-default' }, dispatcher: trackDispatcher(new Agent()) });
     const res = await c.get(url('/echo'));
     const parsed = JSON.parse(res.body) as { headers: Record<string, string> };
     expect(parsed.headers['x-test']).toBe('from-default');
   });
 
   it('per-request headers override defaults', async () => {
-    const c   = new RequestHttpClient({ headers: { 'X-Base': 'base' } });
+    const c   = new RequestHttpClient({ headers: { 'X-Base': 'base' }, dispatcher: trackDispatcher(new Agent()) });
     const res = await c.get(url('/echo'), { headers: { 'X-Override': 'yes' } });
     const parsed = JSON.parse(res.body) as { headers: Record<string, string> };
     expect(parsed.headers['x-base']).toBe('base');
@@ -292,7 +293,7 @@ describe('HttpClientOptions.headers (session-level defaults)', () => {
   });
 
   it('per-request headers override default headers of same name', async () => {
-    const c = new RequestHttpClient({ headers: { 'X-Name': 'session-value' } });
+    const c = new RequestHttpClient({ headers: { 'X-Name': 'session-value' }, dispatcher: trackDispatcher(new Agent()) });
     const res = await c.get(url('/echo'), { headers: { 'X-Name': 'request-value' } });
     const parsed = JSON.parse(res.body) as { headers: Record<string, string> };
     expect(parsed.headers['x-name']).toBe('request-value');
@@ -310,32 +311,29 @@ describe('Shared Dispatcher (session-level connection pool)', () => {
   const url = (path: string): string => `http://127.0.0.1:${srv.port}${path}`;
 
   it('RequestHttpClient accepts a custom Agent dispatcher', async () => {
-    const agent  = new Agent({ connections: 2 });
+    const agent  = trackDispatcher(new Agent({ connections: 2 }));
     const client = new RequestHttpClient({ dispatcher: agent });
     const res    = await client.get(url('/echo'));
     expect(res.status).toBe(200);
-    await agent.close();
   });
 
   it('FetchHttpClient accepts a custom Agent dispatcher', async () => {
-    const agent  = new Agent({ connections: 2 });
+    const agent  = trackDispatcher(new Agent({ connections: 2 }));
     const client = new FetchHttpClient({ dispatcher: agent });
     const res    = await client.get(url('/echo'));
     expect(res.status).toBe(200);
-    await agent.close();
   });
 
   it('DispatchHttpClient uses the provided dispatcher', async () => {
     // Pool is bound to our test server origin
-    const agent  = new Agent();
+    const agent  = trackDispatcher(new Agent());
     const client = new DispatchHttpClient({ dispatcher: agent });
     const res    = await client.get(url('/echo'));
     expect(res.status).toBe(200);
-    await agent.close();
   });
 
   it('two clients sharing the same Agent dispatcher both succeed', async () => {
-    const shared  = new Agent({ connections: 4 });
+    const shared  = trackDispatcher(new Agent({ connections: 4 }));
     const clientA = new RequestHttpClient({ dispatcher: shared });
     const clientB = new FetchHttpClient({ dispatcher: shared });
 
@@ -346,7 +344,6 @@ describe('Shared Dispatcher (session-level connection pool)', () => {
 
     expect(a.status).toBe(200);
     expect(b.status).toBe(200);
-    await shared.close();
   });
 });
 
@@ -361,45 +358,45 @@ describe('Request timeout', () => {
   const url = (path: string): string => `http://127.0.0.1:${srv.port}${path}`;
 
   it('RequestHttpClient times out', async () => {
-    const c = new RequestHttpClient({ timeout: 100 });
+    const c = new RequestHttpClient({ timeout: 100, dispatcher: trackDispatcher(new Agent()) });
     await expect(() => c.get(url('/timeout'))).rejects.toThrow(/timeout|timed out/i);
   });
 
   it('FetchHttpClient times out', async () => {
-    const c = new FetchHttpClient({ timeout: 100 });
+    const c = new FetchHttpClient({ timeout: 100, dispatcher: trackDispatcher(new Agent()) });
     await expect(() => c.get(url('/timeout'))).rejects.toThrow(/timeout|timed out|abort/i);
   });
 
   it('FetchHttpClient with timeout 0 does not schedule abort timer', async () => {
-    const c = new FetchHttpClient({ timeout: 0 });
+    const c = new FetchHttpClient({ timeout: 0, dispatcher: trackDispatcher(new Agent()) });
     const res = await c.get(url('/echo'));
     expect(res.status).toBe(200);
   });
 
   it('FetchHttpClient with timeout 0 uses catch path without clearTimeout (no timer)', async () => {
-    const c = new FetchHttpClient({ timeout: 0 });
+    const c = new FetchHttpClient({ timeout: 0, dispatcher: trackDispatcher(new Agent()) });
     await expect(() => c.get('http://127.0.0.1:1/echo')).rejects.toThrow(
       /ECONNREFUSED|fetch failed|connect/i,
     );
   });
 
   it('StreamHttpClient times out', async () => {
-    const c = new StreamHttpClient({ timeout: 100 });
+    const c = new StreamHttpClient({ timeout: 100, dispatcher: trackDispatcher(new Agent()) });
     await expect(() => c.get(url('/timeout'))).rejects.toThrow(/timeout|timed out/i);
   });
 
   it('PipelineHttpClient times out', async () => {
-    const c = new PipelineHttpClient({ timeout: 100 });
+    const c = new PipelineHttpClient({ timeout: 100, dispatcher: trackDispatcher(new Agent()) });
     await expect(() => c.get(url('/timeout'))).rejects.toThrow(/timeout|timed out/i);
   });
 
   it('DispatchHttpClient times out', async () => {
-    const c = new DispatchHttpClient({ timeout: 100 });
+    const c = new DispatchHttpClient({ timeout: 100, dispatcher: trackDispatcher(new Agent()) });
     await expect(() => c.get(url('/timeout'))).rejects.toThrow(/timeout|timed out/i);
   });
 
   it('DispatchHttpClient with timeout 0 skips the timer block (lines 655-662 false branch)', async () => {
-    const c = new DispatchHttpClient({ timeout: 0 });
+    const c = new DispatchHttpClient({ timeout: 0, dispatcher: trackDispatcher(new Agent()) });
     const res = await c.get(url('/echo'));
     expect(res.status).toBe(200);
   });

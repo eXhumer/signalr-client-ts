@@ -53,7 +53,7 @@
  * 11.  Server non-2xx in the poll loop triggers onclose with error
  */
 
-import { describe, it, beforeAll, afterAll, expect } from 'vitest';
+import { describe, it, beforeAll, afterAll, expect, vi } from 'vitest';
 import * as http from 'node:http';
 import * as net  from 'node:net';
 
@@ -77,6 +77,8 @@ interface LpTestServer {
   readonly url:           string;
   /** Bodies received via POST, in arrival order. */
   readonly receivedPosts: string[];
+  /** Number of GET polls received. */
+  readonly getCount:      number;
   /** Number of DELETE requests received. */
   deleteCount:            number;
 
@@ -104,11 +106,13 @@ async function createLpTestServer(): Promise<LpTestServer> {
 
   const receivedPosts: string[] = [];
   let deleteCount               = 0;
+  let getCount                  = 0;
   let nextPostStatus            = 200;
 
   const server = http.createServer(
     (req: http.IncomingMessage, res: http.ServerResponse) => {
       if (req.method === 'GET') {
+        getCount++;
         // Dequeue a staged response or wait until one is available
         const staged = getQueue.shift();
         if (staged) {
@@ -152,6 +156,7 @@ async function createLpTestServer(): Promise<LpTestServer> {
     port,
     url: `http://127.0.0.1:${port}/poll`,
     receivedPosts,
+    get getCount() { return getCount; },
     deleteCount,
 
     queueGet(response: StagedGetResponse): void {
@@ -201,10 +206,7 @@ function makeTransport(): {
 
 /** Wait up to `ms` ms for `condition` to become true. */
 async function waitFor(condition: () => boolean, ms = 500): Promise<void> {
-  const start = Date.now();
-  while (!condition() && Date.now() - start < ms) {
-    await new Promise<void>((r) => setTimeout(r, 10));
-  }
+  await vi.waitFor(() => expect(condition()).toBe(true), { timeout: ms, interval: 10 });
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -235,9 +237,7 @@ describe('LongPollingTransport', () => {
     // Wait for 204 to stop the background loop
     await closed;
 
-    // At least one GET was served (the initial one); the 204 makes a second.
-    // The test simply verifies connect() resolved without throwing.
-    expect(true).toBeTruthy();
+    expect(srv.getCount).toBeGreaterThanOrEqual(2);
   });
 
   // ── 2. connect() rejects on non-2xx initial GET ───────────────────────────
@@ -538,7 +538,7 @@ function makeMockClient(overrides: {
   } as unknown as IHttpClient;
 }
 
-describe('LongPollingTransport - mock IHttpClient (catch-block + buildHeaders coverage)', () => {
+describe('LongPollingTransport - request errors and authorization headers', () => {
 
   it('accessTokenFactory returning a token sends Authorization header (lines 164-165)', async () => {
     let capturedAuth = '';

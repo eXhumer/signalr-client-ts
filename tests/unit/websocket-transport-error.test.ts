@@ -39,7 +39,7 @@ import { describe, it, expect, vi } from 'vitest';
 // vi.hoisted() runs before *both* static imports and vi.mock() factories,
 // so FakeWebSocket is available inside the factory and in every test body.
 
-const { FakeWebSocket, setConnectError, setPostOpenError } = vi.hoisted(() => {
+const { FakeWebSocket, setConnectError, setPostOpenError, setSendError } = vi.hoisted(() => {
   type ErrorEvent = { error?: unknown; message?: string };
 
   // ── Mode 1: connect-time error (emitted before 'open') ──
@@ -52,9 +52,11 @@ const { FakeWebSocket, setConnectError, setPostOpenError } = vi.hoisted(() => {
     readyState?: number;
   };
   let postOpenCfg: PostOpenCfg | null = null;
+  let sendError: unknown | null = null;
 
   function setConnectError(cfg: ErrorEvent | null): void   { connectErrCfg = cfg; }
   function setPostOpenError(cfg: PostOpenCfg | null): void { postOpenCfg   = cfg; }
+  function setSendError(error: unknown | null): void       { sendError = error; }
 
   class FakeWebSocket {
     static readonly CONNECTING = 0;
@@ -101,6 +103,11 @@ const { FakeWebSocket, setConnectError, setPostOpenError } = vi.hoisted(() => {
             for (const h of (this.#listeners.get('error') ?? [])) h(ev);
           });
         });
+      } else {
+        setImmediate(() => {
+          this.readyState = FakeWebSocket.OPEN;
+          for (const h of (this.#listeners.get('open') ?? [])) h({ type: 'open' });
+        });
       }
     }
 
@@ -112,10 +119,12 @@ const { FakeWebSocket, setConnectError, setPostOpenError } = vi.hoisted(() => {
 
     removeEventListener(_type: string, _cb: unknown): void { /* no-op */ }
     close(_code?: number, _reason?: string): void          { /* no-op */ }
-    send(_data: unknown): void                             { /* no-op */ }
+    send(_data: unknown): void {
+      if (sendError !== null) throw sendError;
+    }
   }
 
-  return { FakeWebSocket, setConnectError, setPostOpenError };
+  return { FakeWebSocket, setConnectError, setPostOpenError, setSendError };
 });
 
 // ── Intercept undici.WebSocket before WebSocketTransport imports it ───────────
@@ -295,5 +304,29 @@ describe('WebSocketTransport - post-open error listener branches (lines 183-200)
     setPostOpenError(null);
 
     expect(closeCalled, 'onclose must NOT fire when error is silently ignored').toBe(false);
+  });
+});
+
+describe('WebSocketTransport.send - synchronous failure', () => {
+  it('preserves an Error thrown by WebSocket.send()', async () => {
+    const transport = new WebSocketTransport(null, new MockLogger());
+    await transport.connect('ws://fake-host', TransferFormat.Text);
+    const failure = new Error('send failed');
+    setSendError(failure);
+
+    const rejection = await transport.send('payload').catch((error: unknown) => error);
+    expect(rejection).toBe(failure);
+
+    setSendError(null);
+  });
+
+  it('wraps a non-Error value thrown by WebSocket.send()', async () => {
+    const transport = new WebSocketTransport(null, new MockLogger());
+    await transport.connect('ws://fake-host', TransferFormat.Text);
+    setSendError('send exploded');
+
+    await expect(transport.send('payload')).rejects.toThrow('send exploded');
+
+    setSendError(null);
   });
 });

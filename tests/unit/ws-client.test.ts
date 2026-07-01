@@ -769,4 +769,86 @@ describe('WebSocketClient', () => {
     ws.close();
     await new Promise<void>((r) => splitServer.close(() => r()));
   });
+
+  it('selects TLS and the default secure port for a wss URL', async () => {
+    const ws = new WebSocketClient();
+    await expect(ws.connect('wss://localhost')).rejects.toThrow();
+    expect(ws.readyState).toBe(WebSocketReadyState.Closed);
+  });
+
+  it('selects the default port for a ws URL', async () => {
+    const ws = new WebSocketClient();
+    await expect(ws.connect('ws://localhost')).rejects.toThrow();
+    expect(ws.readyState).toBe(WebSocketReadyState.Closed);
+  });
+
+  it('buffers multiple continuation fragments before the final frame', async () => {
+    const ws       = new WebSocketClient();
+    const srvSockP = srv.nextSocket();
+    await ws.connect(`ws://127.0.0.1:${srv.port}`);
+    const srvSock = await srvSockP;
+    const messageP = new Promise<string>((resolve) => ws.on('message', resolve));
+    const fragment = (fin: boolean, opcode: number, text: string): Buffer => {
+      const payload = Buffer.from(text);
+      return Buffer.concat([Buffer.from([(fin ? 0x80 : 0) | opcode, payload.length]), payload]);
+    };
+
+    srvSock.write(fragment(false, 0x1, 'one-'));
+    srvSock.write(fragment(false, 0x0, 'two-'));
+    srvSock.write(fragment(true, 0x0, 'three'));
+
+    await expect(messageP).resolves.toBe('one-two-three');
+    ws.close();
+    srvSock.destroy();
+  });
+
+  it('processes a frame included after the handshake and ignores malformed header lines', async () => {
+    const activeSockets: net.Socket[] = [];
+    const server = net.createServer((sock: net.Socket) => {
+      activeSockets.push(sock);
+      let incoming = Buffer.alloc(0);
+      sock.on('data', (chunk: Buffer) => {
+        incoming = Buffer.concat([incoming, chunk]);
+        if (!incoming.includes(Buffer.from('\r\n\r\n'))) return;
+        const match = incoming.toString('utf8').match(/Sec-WebSocket-Key: ([^\r\n]+)/);
+        if (!match) return;
+        const accept = crypto.createHash('sha1').update(match[1]!.trim() + WS_GUID).digest('base64');
+        sock.write(Buffer.concat([
+          Buffer.from(
+            `HTTP/1.1 101 Switching Protocols\r\nMalformedHeader\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+          ),
+          textFrame('handshake-remainder'),
+        ]));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as net.AddressInfo;
+    const ws = new WebSocketClient();
+    const messageP = new Promise<string>((resolve) => ws.on('message', resolve));
+
+    await ws.connect(`ws://127.0.0.1:${port}`);
+    await expect(messageP).resolves.toBe('handshake-remainder');
+
+    ws.close();
+    activeSockets[0]?.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('buffers an incomplete 64-bit frame header before parsing the payload', async () => {
+    const ws       = new WebSocketClient();
+    const srvSockP = srv.nextSocket();
+    await ws.connect(`ws://127.0.0.1:${srv.port}`);
+    const srvSock  = await srvSockP;
+    const payload  = Buffer.alloc(70_000, 0x42);
+    const frame    = encodeServerFrame(0x2, payload);
+    const binaryP  = new Promise<Buffer>((resolve) => ws.on('binary', resolve));
+
+    srvSock.write(frame.subarray(0, 2));
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    srvSock.write(frame.subarray(2));
+
+    await expect(binaryP).resolves.toEqual(payload);
+    ws.close();
+    srvSock.destroy();
+  });
 });

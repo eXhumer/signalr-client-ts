@@ -1,28 +1,8 @@
 /**
  * hub-connection.test.ts
  *
- * Comprehensive state-machine tests for HubConnection using MockTransport.
- *
- * Strategy:
- *  1. Build a HubConnection with a MockTransport injected via the internal
- *     constructor (we import HubConnection directly and pass a custom
- *     "transport" option that maps to HttpTransportType.WebSockets).
- *  2. After start() completes the handshake, inject incoming messages via
- *     transport.receive() and assert outgoing messages via transport.sent[].
- *
- * Because HubConnection calls /negotiate over HTTP before opening the
- * transport, and we want no real network, we subclass HubConnection to
- * intercept the negotiate step - OR we mock the transport factory via
- * the constructor option.
- *
- * Easiest approach: use skipNegotiation:true + WebSockets-only, which
- * bypasses negotiate entirely and directly uses the transport.
- * We then swap the WebSocketTransport before start() by patching the
- * private field via a test-only factory wrapper.
- *
- * In practice this is achieved by a TestableHubConnection helper that
- * overrides createTransport() via a protected-ish escape hatch exposed
- * only in tests.
+ * Integration and state-machine tests for HubConnection using local HTTP and
+ * WebSocket servers through the public API.
  */
 
 import { describe, it, beforeAll, afterAll, beforeEach, afterEach, expect } from 'vitest';
@@ -31,16 +11,13 @@ import * as net  from 'node:net';
 
 import { HubConnection }   from '../../src/hub-connection.js';
 import { HubConnectionBuilder } from '../../src/hub-connection-builder.js';
-import { MockTransport }   from '../helpers/mock-transport.js';
 import { MockLogger }      from '../helpers/mock-logger.js';
 import {
   HubConnectionState,
   HttpTransportType,
   LogLevel,
   MessageType,
-  RECORD_SEPARATOR as RS,
 } from '../../src/constants.js';
-import { JsonHubProtocol } from '../../src/protocols/json-hub-protocol.js';
 import { HubError, AbortError } from '../../src/errors.js';
 import { toInvocationId }  from '../../src/messages.js';
 import { Agent } from 'undici';
@@ -50,122 +27,10 @@ import {
   PipelineHttpClient,
   DispatchHttpClient,
 } from '../../src/http-client.js';
-import type { IHttpClient } from '../../src/interfaces.js';
+import type { IHttpClient, ISubscription } from '../../src/interfaces.js';
+import { closeTrackedDispatchers, trackDispatcher } from '../helpers/dispatcher-tracker.js';
 
-// ─── TestableHubConnection ────────────────────────────────────────────────────
-//
-// We cannot inject a transport directly into the official API.
-// Instead we create a connection, then manually bypass the start() sequence:
-//   1. Set the transport manually
-//   2. Wire onreceive / onclose
-//   3. Send the handshake request and inject the server's handshake response
-//
-
-class TestHarness {
-  readonly transport = new MockTransport();
-  readonly logger    = new MockLogger();
-  readonly conn: HubConnection;
-  private readonly _proto = new JsonHubProtocol();
-
-  constructor(options: { pingInterval?: number; serverTimeout?: number; reconnect?: boolean } = {}) {
-    // Build via official API
-    const builder = new HubConnectionBuilder()
-      .withUrl('http://localhost/hub', { skipNegotiation: true, transport: HttpTransportType.WebSockets })
-      .configureLogging(this.logger);
-
-    if (options.reconnect) {
-      builder.withAutomaticReconnect([0, 0, 0]);
-    }
-
-    this.conn = builder.build();
-  }
-
-  /** Start the connection by directly wiring the mock transport. */
-  async start(): Promise<void> {
-    // Patch private #transport before the real start() can create one.
-    // We do this by intercepting the WebSocketTransport's connect():
-    // Since skipNegotiation=true and transport=WebSockets, the real start()
-    // will try to connect a WebSocketTransport. We'll make the mock intercept.
-    //
-    // Better approach: use the internal _startWithTransport escape hatch
-    // that we add to this file via a symbol-keyed method in hub-connection.ts.
-    //
-    // Since we don't have that, we exercise a well-known trick:
-    // Replace the underlying ws-client module by making skipNegotiation
-    // invoke our mock. We achieve this by subclassing and overriding
-    // the transport creation entirely.
-    //
-    // For this test file we use a different path: manually call the internal
-    // wiring and skip start(), since HubConnection exposes the contract
-    // through the transport callbacks.
-    await this._startManually();
-  }
-
-  private async _startManually(): Promise<void> {
-    // Directly replicate what start() does after the transport connects,
-    // using our mock transport. This is white-box testing of the connection
-    // lifecycle at the message-routing layer.
-
-    // The trick: (conn as any) to access private fields for testing
-    const c = this.conn as unknown as Record<string, unknown>;
-
-    // Inject mock transport
-    c['_HubConnection__transport'] = this.transport;
-    // (TS private name-mangling: #transport → _HubConnection__transport in CommonJS)
-
-    this.transport.onreceive = (data: string | Uint8Array): void => {
-      const fn = c['_HubConnection__processIncoming'] as ((t: string) => void) | undefined;
-      if (fn) fn.call(this.conn, typeof data === 'string' ? data : Buffer.from(data).toString('utf8'));
-    };
-    this.transport.onclose = (err?: Error): void => {
-      const fn = c['_HubConnection__onTransportClosed'] as ((e?: Error) => void) | undefined;
-      if (fn) fn.call(this.conn, err);
-    };
-
-    // Set state to Connected
-    c['_HubConnection__state'] = HubConnectionState.Connected;
-    // Clear handshake flag (already null)
-    // Start keep-alive timers
-    const resetPing   = c['_HubConnection__resetPingTimer']   as (() => void) | undefined;
-    const resetSrvTmo = c['_HubConnection__resetServerTimeoutTimer'] as (() => void) | undefined;
-    resetPing?.call(this.conn);
-    resetSrvTmo?.call(this.conn);
-  }
-
-  /** Simulate the server sending a hub message. */
-  serverSend(msg: Record<string, unknown>): void {
-    const wire = JSON.stringify(msg) + RS;
-    this.transport.receive(wire);
-  }
-
-  /** Return the last message sent by the client, parsed. */
-  lastClientMsg(): Record<string, unknown> {
-    const raw = this.transport.lastSent();
-    return JSON.parse(raw.replace(/\x1e$/, '')) as Record<string, unknown>;
-  }
-
-  /** All client-sent messages, parsed. */
-  allClientMsgs(): Array<Record<string, unknown>> {
-    return this.transport.allSentStrings()
-      .filter((s) => s.trim())
-      .flatMap((s) => s.split(RS).filter(Boolean).map((p) => JSON.parse(p) as Record<string, unknown>));
-  }
-
-  async stop(): Promise<void> {
-    await this.conn.stop();
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Because TypeScript private fields (#field) compile to WeakMap-based storage
-// that cannot be accessed by string keys, we use a different test approach:
-// we spin up a REAL connection through the full start() path with a mock
-// WebSocket server, OR we test via the public API only.
-//
-// The cleanest zero-network approach: expose a testOnly helper on HubConnection.
-// Since we can't modify the source for test-only hooks, we use the
-// real integration approach via the signalr-server helper.
-// ─────────────────────────────────────────────────────────────────────────────
+afterEach(closeTrackedDispatchers);
 
 import { startSignalRServer } from '../helpers/signalr-server.js';
 import type { SignalRTestServer, ServerClient } from '../helpers/signalr-server.js';
@@ -342,6 +207,19 @@ describe('HubConnection - send / invoke', () => {
     await expect(invokeP).rejects.toBeInstanceOf(HubError);
   });
 
+  it('invoke() resolves to null when a Completion has no result', async () => {
+    const msgP = new Promise<Record<string, unknown>>((resolve) => srvCli.on('message', resolve));
+    const invokeP = conn.invoke('VoidMethod');
+    const msg = await msgP;
+
+    srvCli.sendMessage({
+      type: MessageType.Completion,
+      invocationId: msg['invocationId'],
+    });
+
+    await expect(invokeP).resolves.toBeNull();
+  });
+
   it('invoke() is rejected when connection stops mid-flight', async () => {
     // Don't reply from server - just stop the connection
     const invokeP = conn.invoke<string>('Slow');
@@ -370,22 +248,29 @@ describe('HubConnection - on / off', () => {
 
   afterEach(async () => { await conn.stop(); });
 
+  async function flushInvocations(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      const barrier = (): void => {
+        conn.off('__test_barrier__', barrier);
+        resolve();
+      };
+      conn.on('__test_barrier__', barrier);
+      srvCli.sendMessage({ type: MessageType.Invocation, target: '__test_barrier__', arguments: [] });
+    });
+  }
+
   it('on() receives server-sent invocations', async () => {
-    const received: unknown[] = [];
-    conn.on('DataPush', (item: unknown) => received.push(item));
+    const received = new Promise<unknown>((resolve) => conn.on('DataPush', resolve));
 
     srvCli.sendMessage({ type: MessageType.Invocation, target: 'DataPush', arguments: [42] });
-    await new Promise<void>((r) => setTimeout(r, 50));
-    expect(received).toEqual([42]);
+    await expect(received).resolves.toBe(42);
   });
 
   it('on() is case-insensitive for method names', async () => {
-    const calls: unknown[] = [];
-    conn.on('greetUser', (name: unknown) => calls.push(name));
+    const received = new Promise<unknown>((resolve) => conn.on('greetUser', resolve));
 
     srvCli.sendMessage({ type: MessageType.Invocation, target: 'GreetUser', arguments: ['Bob'] });
-    await new Promise<void>((r) => setTimeout(r, 50));
-    expect(calls).toEqual(['Bob']);
+    await expect(received).resolves.toBe('Bob');
   });
 
   it('multiple handlers for the same method all fire', async () => {
@@ -395,7 +280,7 @@ describe('HubConnection - on / off', () => {
     conn.on('Tick', (n: unknown) => log2.push(n));
 
     srvCli.sendMessage({ type: MessageType.Invocation, target: 'Tick', arguments: [1] });
-    await new Promise<void>((r) => setTimeout(r, 50));
+    await flushInvocations();
     expect(log1).toEqual([1]);
     expect(log2).toEqual([1]);
   });
@@ -410,7 +295,7 @@ describe('HubConnection - on / off', () => {
     conn.off('Event', handler1);
 
     srvCli.sendMessage({ type: MessageType.Invocation, target: 'Event', arguments: [7] });
-    await new Promise<void>((r) => setTimeout(r, 50));
+    await flushInvocations();
 
     expect(calls.includes('h1:7'), 'h1 should have been removed').toBeFalsy();
     expect(calls.includes('h2:7'),  'h2 should still fire').toBeTruthy();
@@ -423,8 +308,36 @@ describe('HubConnection - on / off', () => {
     conn.off('Gone');
 
     srvCli.sendMessage({ type: MessageType.Invocation, target: 'Gone', arguments: [] });
-    await new Promise<void>((r) => setTimeout(r, 50));
+    await flushInvocations();
     expect(calls.length).toBe(0);
+  });
+
+  it('off() is a no-op for an unknown method', () => {
+    expect(() => conn.off('never-registered')).not.toThrow();
+  });
+
+  it('off() removes the method entry when its final handler is removed', async () => {
+    let called = false;
+    const handler = (): void => { called = true; };
+    conn.on('single', handler);
+    conn.off('single', handler);
+
+    srvCli.sendMessage({ type: MessageType.Invocation, target: 'single', arguments: [] });
+    await flushInvocations();
+    expect(called).toBe(false);
+  });
+
+  it('off() removes one handler but retains the method while others remain', async () => {
+    const calls: string[] = [];
+    const first = (): void => { calls.push('first'); };
+    const second = (): void => { calls.push('second'); };
+    conn.on('multi', first);
+    conn.on('multi', second);
+    conn.off('multi', first);
+
+    srvCli.sendMessage({ type: MessageType.Invocation, target: 'multi', arguments: [] });
+    await flushInvocations();
+    expect(calls).toEqual(['second']);
   });
 });
 
@@ -521,6 +434,32 @@ describe('HubConnection - streaming', () => {
     const sub2 = conn.stream<number>('Loop2').subscribe({ next: () => {} });
     expect(typeof sub2[Symbol.dispose]).toBe('function');
     sub2.dispose();
+    sub2.dispose(); // idempotent: the cancellation callback runs only once
+  });
+
+  it('dispose() after server completion is an idempotent no-op', async () => {
+    const msgP = new Promise<Record<string, unknown>>((resolve) => srvCli.on('message', resolve));
+    let sub: ISubscription;
+    const completedP = new Promise<void>((resolve) => {
+      sub = conn.stream<number>('Finite').subscribe({ complete: resolve });
+      void msgP.then((msg) => {
+        srvCli.sendMessage({ type: MessageType.Completion, invocationId: msg['invocationId'] });
+      });
+    });
+
+    await completedP;
+    sub!.dispose();
+  });
+
+  it('stopping a connection errors an active stream subscriber', async () => {
+    const msgP = new Promise<Record<string, unknown>>((resolve) => srvCli.on('message', resolve));
+    const errorP = new Promise<Error>((resolve) => {
+      conn.stream<number>('NeverCompletes').subscribe({ error: resolve });
+    });
+    await msgP;
+
+    await conn.stop();
+    await expect(errorP).resolves.toBeInstanceOf(AbortError);
   });
 });
 
@@ -809,7 +748,7 @@ describe('HubConnection - shared Dispatcher (withDispatcher)', () => {
   afterAll(async ()  => { await srv.close(); });
 
   it('withDispatcher(Agent) - full connect/stop cycle succeeds', async () => {
-    const agent = new Agent({ connections: 4 });
+    const agent = trackDispatcher(new Agent({ connections: 4 }));
 
     const conn = new HubConnectionBuilder()
       .withUrl(srv.url)
@@ -823,13 +762,12 @@ describe('HubConnection - shared Dispatcher (withDispatcher)', () => {
 
     expect(conn.state).toBe(HubConnectionState.Connected);
     await conn.stop();
-    await agent.close();
   });
 
   it('two connections sharing one Agent both connect successfully', async () => {
     // The shared Agent must handle at least 2 concurrent connections:
     // each needs one TCP socket for negotiate (HTTP) and one for the WebSocket.
-    const shared = new Agent({ connections: 8 });
+    const shared = trackDispatcher(new Agent({ connections: 8 }));
 
     const conn1 = new HubConnectionBuilder()
       .withUrl(srv.url)
@@ -854,13 +792,12 @@ describe('HubConnection - shared Dispatcher (withDispatcher)', () => {
     expect(conn2.state, 'conn2 should be Connected').toBe(HubConnectionState.Connected);
 
     await Promise.all([conn1.stop(), conn2.stop()]);
-    await shared.close();
   });
 
   it('withDispatcher + withHttpClient both accepted by the builder', async () => {
     // When both are specified, the dispatcher goes to WebSocketTransport and
     // the httpClient (with its own dispatcher) handles negotiate.
-    const agent  = new Agent({ connections: 2 });
+    const agent  = trackDispatcher(new Agent({ connections: 2 }));
     const client = new FetchHttpClient({ dispatcher: agent });
 
     const conn = new HubConnectionBuilder()
@@ -876,13 +813,12 @@ describe('HubConnection - shared Dispatcher (withDispatcher)', () => {
 
     expect(conn.state).toBe(HubConnectionState.Connected);
     await conn.stop();
-    await agent.close();
   });
 });
 
 // ─── Coverage gaps: miscellaneous public-API and message-routing branches ─────
 
-describe('HubConnection - coverage gaps (miscellaneous)', () => {
+describe('HubConnection - lifecycle and callback edge cases', () => {
   let srv: SignalRTestServer;
 
   beforeAll(async () => { srv = await startSignalRServer(); });
@@ -1668,7 +1604,7 @@ describe('HubConnection - cookie handling', () => {
 // Coverage gaps - hub-connection.ts
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('HubConnection - coverage gaps (hub-connection.ts)', () => {
+describe('HubConnection - constructor and send failures', () => {
 
   // ── L174: default parameter Branch #1 ───────────────────────────────────
   // `options: HubConnectionOptions = {}` - Istanbul marks two branches:
@@ -1804,7 +1740,7 @@ async function makeNegotiateSrv(
   };
 }
 
-describe('HubConnection - coverage gaps II (hub-connection.ts deeper paths)', () => {
+describe('HubConnection - protocol and transport failure handling', () => {
   let srv: SignalRTestServer;
 
   beforeAll(async ()  => { srv = await startSignalRServer(); });

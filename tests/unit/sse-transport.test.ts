@@ -36,7 +36,7 @@
  * 13.  onclose fires with an error when the stream errors
  */
 
-import { describe, it, beforeAll, afterAll, expect } from 'vitest';
+import { describe, it, beforeAll, afterAll, afterEach, expect, vi } from 'vitest';
 import * as http from 'node:http';
 import * as net  from 'node:net';
 import { Agent } from 'undici';
@@ -45,6 +45,9 @@ import { ServerSentEventsTransport } from '../../src/transports/sse-transport.js
 import { TransferFormat }            from '../../src/constants.js';
 import { RequestHttpClient }         from '../../src/http-client.js';
 import { MockLogger }                from '../helpers/mock-logger.js';
+import { closeTrackedDispatchers, trackDispatcher } from '../helpers/dispatcher-tracker.js';
+
+afterEach(closeTrackedDispatchers);
 
 // ─── SSE test server ──────────────────────────────────────────────────────────
 
@@ -168,7 +171,7 @@ function makeTransport(): {
   const transport = new ServerSentEventsTransport(
     // Use a fresh Agent per transport so connection-pool state from one test
     // cannot contaminate the next test's SSE stream.
-    new RequestHttpClient({ timeout: 5_000, dispatcher: new Agent() }),
+    new RequestHttpClient({ timeout: 5_000, dispatcher: trackDispatcher(new Agent()) }),
     null,                  // no access-token factory
     logger,
     {},                    // no extra headers
@@ -185,10 +188,7 @@ function sseEvent(data: string): string {
 
 /** Wait up to `ms` milliseconds for `condition` to become true. */
 async function waitFor(condition: () => boolean, ms = 300): Promise<void> {
-  const start = Date.now();
-  while (!condition() && Date.now() - start < ms) {
-    await new Promise<void>((r) => setTimeout(r, 10));
-  }
+  await vi.waitFor(() => expect(condition()).toBe(true), { timeout: ms, interval: 10 });
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -495,7 +495,7 @@ describe('ServerSentEventsTransport', () => {
 
     const logger    = new MockLogger();
     const transport = new ServerSentEventsTransport(
-      new RequestHttpClient({ timeout: 5_000, dispatcher: new Agent() }),
+      new RequestHttpClient({ timeout: 5_000, dispatcher: trackDispatcher(new Agent()) }),
       async (): Promise<string> => 'test-bearer-token',
       logger,
       {},
@@ -537,7 +537,7 @@ describe('ServerSentEventsTransport', () => {
     const { port: tokenPort } = tokenSrv.address() as net.AddressInfo;
 
     const transport = new ServerSentEventsTransport(
-      new RequestHttpClient({ timeout: 5_000, dispatcher: new Agent() }),
+      new RequestHttpClient({ timeout: 5_000, dispatcher: trackDispatcher(new Agent()) }),
       async (): Promise<string> => 'send-bearer-token',
       new MockLogger(),
       {},
@@ -666,7 +666,7 @@ describe('ServerSentEventsTransport', () => {
   it('send() with accessTokenFactory returning null sends no Authorization header (line 108)', async () => {
     const logger    = new MockLogger();
     const transport = new ServerSentEventsTransport(
-      new RequestHttpClient({ timeout: 5_000, dispatcher: new Agent() }),
+      new RequestHttpClient({ timeout: 5_000, dispatcher: trackDispatcher(new Agent()) }),
       async () => null,  // returns null → no Authorization header
       logger,
       {},
@@ -688,7 +688,7 @@ describe('ServerSentEventsTransport', () => {
     // Omitting the 4th argument exercises the default parameter branch `= {}`
     const logger    = new MockLogger();
     const transport = new ServerSentEventsTransport(
-      new RequestHttpClient({ timeout: 5_000, dispatcher: new Agent() }),
+      new RequestHttpClient({ timeout: 5_000, dispatcher: trackDispatcher(new Agent()) }),
       null,
       logger,
       // intentionally omit extraHeaders → default {} is used
