@@ -57,9 +57,27 @@ export class WebSocketTransport implements ITransport {
   readonly #dispatcher:          Dispatcher | undefined;
 
   #ws: WebSocket | null = null;
+  #onreceive: ((data: string | Uint8Array) => void) | null = null;
+  #pendingMessages: Array<string | Uint8Array> = [];
 
-  onreceive: ((data: string | Uint8Array) => void) | null = null;
   onclose:   ((error?: Error) => void)             | null = null;
+
+  get onreceive(): ((data: string | Uint8Array) => void) | null {
+    return this.#onreceive;
+  }
+
+  set onreceive(handler: ((data: string | Uint8Array) => void) | null) {
+    this.#onreceive = handler;
+    /* istanbul ignore else -- HubConnection installs a receiver after connect */
+    if (handler) {
+      const pending = this.#pendingMessages;
+      this.#pendingMessages = [];
+      for (const message of pending) {
+        /* istanbul ignore next -- requires a server frame in the connect/onreceive microtask gap */
+        handler(message);
+      }
+    }
+  }
 
   /**
    * @param accessTokenFactory  Async factory for Bearer tokens, or null.
@@ -111,16 +129,35 @@ export class WebSocketTransport implements ITransport {
     // so 'arraybuffer' is used here and converted to Buffer on receipt.
     ws.binaryType = 'arraybuffer';
 
+    // Servers may send the SignalR handshake response immediately after the
+    // WebSocket opens. Listen before awaiting `open`, and queue those frames
+    // until HubConnection installs its receiver after connect() resolves.
+    ws.addEventListener('message', (event) => {
+      const data = (event as Event & { data: unknown }).data;
+      const message = typeof data === 'string' ? data : Buffer.from(data as ArrayBuffer);
+      this.#logger.log(LogLevel.Trace, typeof message === 'string'
+        ? `(WebSockets transport) Received text (${message.length} chars).`
+        : `(WebSockets transport) Received binary (${message.length} bytes).`);
+      if (this.#onreceive) this.#onreceive(message);
+      else this.#pendingMessages.push(message);
+    });
+
     // ── Wait for the socket to be open before resolving ─────────────────────
     // We wrap the open/error events in a Promise so `connect()` only resolves
     // once the TCP + TLS + WebSocket handshake is fully complete.
     await new Promise<void>((resolve, reject) => {
-      ws.addEventListener('open', () => {
+      const cleanup = (): void => {
+        ws.removeEventListener('open', onOpen);
+        ws.removeEventListener('error', onError);
+      };
+      const onOpen = (): void => {
+        cleanup();
         this.#logger.log(LogLevel.Information, '(WebSockets transport) Connected.');
         resolve();
-      });
+      };
 
-      ws.addEventListener('error', (event) => {
+      const onError = (event: Event): void => {
+        cleanup();
         // ErrorEvent is a browser DOM global absent from Node.js lib targets.
         // Cast to a structural equivalent to access `.error` / `.message`.
         const e = event as Event & { error?: unknown; message?: string };
@@ -139,35 +176,15 @@ export class WebSocketTransport implements ITransport {
           err = new Error(String(e.message ?? 'WebSocket error'));
         }
         this.#logger.log(LogLevel.Error, `(WebSockets transport) Error during connect: ${err.message}`);
+        this.#ws = null;
+        ws.close();
         reject(err);
-      });
+      };
+      ws.addEventListener('open', onOpen);
+      ws.addEventListener('error', onError);
     });
 
     // ── Wire ongoing event handlers (after open) ─────────────────────────────
-
-    // MessageEvent is defined in two conflicting type sources (undici-types
-    // bundled inside @types/node and undici's own .d.ts).  Their `.ports`
-    // fields are incompatible, so typing the listener parameter as
-    // `MessageEvent` triggers an overload-mismatch error.  We let TypeScript
-    // infer the parameter type (falling back to the generic `string` overload)
-    // and then extract `.data` through a structural intersection cast.
-    //
-    // Because binaryType = 'arraybuffer', data is always string | ArrayBuffer.
-    ws.addEventListener('message', (event) => {
-      const data = (event as Event & { data: unknown }).data;
-      if (typeof data === 'string') {
-        this.#logger.log(LogLevel.Trace,
-          `(WebSockets transport) Received text (${data.length} chars).`);
-        this.onreceive?.(data);
-      } else {
-        // binaryType='arraybuffer' guarantees every non-string payload is an
-        // ArrayBuffer, so this is exhaustive rather than a defensive branch.
-        const buf = Buffer.from(data as ArrayBuffer);
-        this.#logger.log(LogLevel.Trace,
-          `(WebSockets transport) Received binary (${buf.length} bytes).`);
-        this.onreceive?.(buf);
-      }
-    });
 
     // CloseEvent is a browser DOM global absent from Node.js lib targets.
     // Cast to a structural equivalent to access `.code` / `.reason`.

@@ -21,7 +21,7 @@ import { HubConnection }  from './hub-connection.js';
 import type { HubConnectionOptions } from './hub-connection.js';
 import { resolveLogger }  from './logger.js';
 import { LogLevel, HttpTransportType } from './constants.js';
-import type { ILogger, IHttpClient, IRetryPolicy, RetryContext, Dispatcher } from './interfaces.js';
+import type { ILogger, IHttpClient, IHubProtocol, IRetryPolicy, RetryContext, Dispatcher } from './interfaces.js';
 import { CookieAgent } from '@exhumer/undici-cookie-agent';
 import { CookieJar } from 'tough-cookie';
 
@@ -51,6 +51,8 @@ export interface UrlOptions {
   readonly keepAliveIntervalInMilliseconds?: number;
   /** ms to wait for the SignalR handshake response (default: 15 000). */
   readonly handshakeTimeoutInMilliseconds?: number;
+  /** Maximum accepted transport payload size (default: 32 MiB). */
+  readonly maximumReceiveMessageSize?: number;
 }
 
 // ─── HubConnectionBuilder ────────────────────────────────────────────────────
@@ -63,6 +65,7 @@ export class HubConnectionBuilder {
   #dispatcher:      Dispatcher | null   = null;
   #httpClient:      IHttpClient | null  = null;
   #cookieJar:       CookieJar  | null  = null;
+  #protocol:        IHubProtocol | null = null;
 
   // ─── withUrl ─────────────────────────────────────────────────────────────
 
@@ -210,6 +213,12 @@ export class HubConnectionBuilder {
     return this;
   }
 
+  /** Select the hub wire protocol (for example, MessagePack). */
+  withHubProtocol(protocol: IHubProtocol): this {
+    this.#protocol = protocol;
+    return this;
+  }
+
   // ─── configureLogging ────────────────────────────────────────────────────
 
   /**
@@ -291,9 +300,12 @@ export class HubConnectionBuilder {
       ...(this.#urlOptions.serverTimeoutInMilliseconds     != null && { serverTimeoutInMilliseconds:     this.#urlOptions.serverTimeoutInMilliseconds }),
       ...(this.#urlOptions.keepAliveIntervalInMilliseconds != null && { keepAliveIntervalInMilliseconds: this.#urlOptions.keepAliveIntervalInMilliseconds }),
       ...(this.#urlOptions.handshakeTimeoutInMilliseconds  != null && { handshakeTimeoutInMilliseconds:  this.#urlOptions.handshakeTimeoutInMilliseconds }),
+      ...(this.#urlOptions.maximumReceiveMessageSize       != null && { maximumReceiveMessageSize:       this.#urlOptions.maximumReceiveMessageSize }),
       ...(this.#reconnectPolicy    != null && { reconnectPolicy: this.#reconnectPolicy }),
       ...(effectiveDispatcher      != null && { dispatcher:      effectiveDispatcher  }),
       ...(this.#httpClient         != null && { httpClient:      this.#httpClient     }),
+      ...(this.#protocol           != null && { protocol:        this.#protocol       }),
+      ...(this.#cookieJar          != null && { ownsDispatcher:  true                 }),
     };
 
     return new HubConnection(this.#url, options);

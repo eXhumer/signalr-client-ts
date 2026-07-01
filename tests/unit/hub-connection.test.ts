@@ -27,6 +27,7 @@ import {
   PipelineHttpClient,
   DispatchHttpClient,
 } from '../../src/http-client.js';
+import { MsgpackHubProtocol } from '../../src/protocols/msgpack-hub-protocol.js';
 import type { IHttpClient, ISubscription } from '../../src/interfaces.js';
 import { closeTrackedDispatchers, trackDispatcher } from '../helpers/dispatcher-tracker.js';
 
@@ -121,8 +122,8 @@ describe('HubConnection - lifecycle', () => {
     await conn.start();
     srvCli = await clientP;
     await conn.stop();
-    // onclose may fire asynchronously with the transport's close
     expect(conn.state).toBe(HubConnectionState.Disconnected);
+    expect(closed).toBe(true);
   });
 });
 
@@ -339,6 +340,59 @@ describe('HubConnection - on / off', () => {
     await flushInvocations();
     expect(calls).toEqual(['second']);
   });
+
+  it('returns a Completion result for a server invocation with an invocationId', async () => {
+    conn.on('ClientResult', async (value: number) => value * 2);
+    const completionP = new Promise<Record<string, unknown>>((resolve) => srvCli.on('message', resolve));
+
+    srvCli.sendMessage({
+      type: MessageType.Invocation,
+      invocationId: 'server-1',
+      target: 'ClientResult',
+      arguments: [21],
+    });
+
+    await expect(completionP).resolves.toMatchObject({
+      type: MessageType.Completion,
+      invocationId: 'server-1',
+      result: 42,
+    });
+  });
+
+  it('returns a Completion error when a result-bearing handler throws', async () => {
+    conn.on('ClientFailure', () => {
+      // JavaScript handlers may throw non-Error values; normalize those on wire.
+      // eslint-disable-next-line @typescript-eslint/only-throw-error
+      throw 'client handler failed';
+    });
+    const completionP = new Promise<Record<string, unknown>>((resolve) => srvCli.on('message', resolve));
+
+    srvCli.sendMessage({
+      type: MessageType.Invocation,
+      invocationId: 'server-2',
+      target: 'ClientFailure',
+      arguments: [],
+    });
+
+    await expect(completionP).resolves.toMatchObject({
+      type: MessageType.Completion,
+      invocationId: 'server-2',
+      error: 'client handler failed',
+    });
+  });
+
+  it('returns a Completion error when no result-bearing handler exists', async () => {
+    const completionP = new Promise<Record<string, unknown>>((resolve) => srvCli.on('message', resolve));
+    srvCli.sendMessage({
+      type: MessageType.Invocation,
+      invocationId: 'server-3',
+      target: 'MissingClientMethod',
+      arguments: [],
+    });
+    const completion = await completionP;
+    expect(completion['type']).toBe(MessageType.Completion);
+    expect(completion['error']).toMatch(/No client handler/i);
+  });
 });
 
 describe('HubConnection - streaming', () => {
@@ -461,6 +515,21 @@ describe('HubConnection - streaming', () => {
     await conn.stop();
     await expect(errorP).resolves.toBeInstanceOf(AbortError);
   });
+
+  it('starts a stream immediately and rejects a second subscriber', async () => {
+    const invocationP = new Promise<Record<string, unknown>>((resolve) => srvCli.on('message', resolve));
+    const result = conn.stream<number>('ImmediateStream');
+    const invocation = await invocationP;
+    expect(invocation).toMatchObject({ type: MessageType.StreamInvocation });
+    srvCli.sendMessage({ type: MessageType.StreamItem, invocationId: invocation['invocationId'], item: 42 });
+    srvCli.sendMessage({ type: MessageType.Completion, invocationId: invocation['invocationId'] });
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+    const values: number[] = [];
+    result.subscribe({ next: (value) => values.push(value) });
+    expect(values).toEqual([42]);
+    expect(() => result.subscribe({ next: () => {} })).toThrow(/only be subscribed to once/i);
+  });
 });
 
 describe('HubConnection - Server Close message', () => {
@@ -582,7 +651,10 @@ describe('HubConnection - auto-reconnect', () => {
 
   it('reconnects after unexpected transport close', async () => {
     const conn = new HubConnectionBuilder()
-      .withUrl(srv.url)
+      .withUrl(srv.url, {
+        skipNegotiation: true,
+        transport: HttpTransportType.WebSockets,
+      })
       .configureLogging(LogLevel.None)
       .withAutomaticReconnect([0, 0]) // zero delay for fast tests
       .build();
@@ -816,6 +888,39 @@ describe('HubConnection - shared Dispatcher (withDispatcher)', () => {
   });
 });
 
+describe('HubConnection - selectable hub protocol', () => {
+  let srv: SignalRTestServer;
+  beforeAll(async () => { srv = await startSignalRServer(); });
+  afterAll(async () => { await srv.close(); });
+
+  it('uses MessagePack handshake metadata and binary message encoding', async () => {
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url, {
+        skipNegotiation: true,
+        transport: HttpTransportType.WebSockets,
+      })
+      .withHubProtocol(new MsgpackHubProtocol())
+      .build();
+    const clientP = srv.nextClient();
+    await conn.start();
+    await clientP;
+
+    const originalSend = WebSocketTransport.prototype.send;
+    let sent: string | Uint8Array | null = null;
+    WebSocketTransport.prototype.send = (data): Promise<void> => {
+      sent = data;
+      return Promise.resolve();
+    };
+    try {
+      await conn.send('BinaryCall', { value: 1 });
+      expect(sent).toBeInstanceOf(Uint8Array);
+    } finally {
+      WebSocketTransport.prototype.send = originalSend;
+      await conn.stop();
+    }
+  });
+});
+
 // ─── Coverage gaps: miscellaneous public-API and message-routing branches ─────
 
 describe('HubConnection - lifecycle and callback edge cases', () => {
@@ -848,7 +953,7 @@ describe('HubConnection - lifecycle and callback edge cases', () => {
       .configureLogging(LogLevel.None)
       .build();
 
-    await expect(conn.start()).rejects.toThrow(/skipNegotiation requires the WebSockets/i);
+    await expect(conn.start()).rejects.toThrow(/skipNegotiation requires WebSockets/i);
     expect(conn.state).toBe(HubConnectionState.Disconnected);
   });
 
@@ -1746,6 +1851,44 @@ describe('HubConnection - protocol and transport failure handling', () => {
   beforeAll(async ()  => { srv = await startSignalRServer(); });
   afterAll(async ()   => { await srv.close(); });
   beforeEach(()       => { srv.requests.length = 0; });
+
+  it('rejects transports that do not support the selected protocol format', async () => {
+    const binaryOnly = await makeNegotiateSrv([
+      { transport: 'WebSockets', transferFormats: ['Binary'] },
+    ]);
+    const conn = new HubConnectionBuilder().withUrl(binaryOnly.url).build();
+
+    await expect(conn.start()).rejects.toThrow(/Unable to connect/i);
+    await binaryOnly.stop();
+  });
+
+  it('rejects an oversized negotiate response', async () => {
+    const oversized = await makeNegotiateSrv([], (req, res) => {
+      if (!req.url?.includes('/negotiate')) return false;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ padding: 'x'.repeat(256) }));
+      return true;
+    });
+    const conn = new HubConnectionBuilder()
+      .withUrl(oversized.url, { maximumReceiveMessageSize: 64 })
+      .build();
+
+    await expect(conn.start()).rejects.toThrow(/Negotiate response exceeds/i);
+    await oversized.stop();
+  });
+
+  it('closes when a transport payload exceeds the configured size', async () => {
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url, { maximumReceiveMessageSize: 256 })
+      .build();
+    const clientP = srv.nextClient();
+    const closedP = new Promise<Error | undefined>((resolve) => conn.onclose(resolve));
+    await conn.start();
+    const client = await clientP;
+
+    client.sendMessage({ type: MessageType.Invocation, target: 'Huge', arguments: ['x'.repeat(1024)] });
+    expect((await closedP)?.message).toMatch(/exceeds/i);
+  });
 
   // ── L615: server sends a Ping (Type 6) ──────────────────────────────────
 

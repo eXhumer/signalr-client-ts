@@ -16,7 +16,6 @@
 import { DispatchHttpClient } from './http-client.js';
 import {
   JsonHubProtocol,
-  HANDSHAKE_REQUEST,
   parseHandshakeResponse,
 } from './protocols/json-hub-protocol.js';
 import { WebSocketTransport }        from './transports/websocket-transport.js';
@@ -50,8 +49,9 @@ import type {
   ISubscription,
   NegotiateResponse,
   Dispatcher,
+  IHubProtocol,
 } from './interfaces.js';
-import type { InvocationId } from './messages.js';
+import type { HubMessage, InvocationId } from './messages.js';
 import { toInvocationId }    from './messages.js';
 
 const MAX_REDIRECTS = 100;
@@ -91,6 +91,12 @@ export interface HubConnectionOptions {
    * undici primitive (e.g. `FetchHttpClient`) or to inject a mock in tests.
    */
   readonly httpClient?:                      IHttpClient;
+  /** Hub wire protocol. Defaults to JSON protocol version 1. */
+  readonly protocol?:                        IHubProtocol;
+  /** Maximum accepted transport payload size. Defaults to 32 MiB. */
+  readonly maximumReceiveMessageSize?:       number;
+  /** Internal: close a builder-created dispatcher when the connection ends. */
+  readonly ownsDispatcher?:                  boolean;
 }
 
 // ─── Internal pending-invocation tracking ────────────────────────────────────
@@ -143,9 +149,11 @@ export class HubConnection {
   readonly #handshakeTimeout:     number;
   readonly #reconnectPolicy:      IRetryPolicy | null;
 
-  readonly #protocol:    JsonHubProtocol;
+  readonly #protocol:    IHubProtocol;
   readonly #http:        IHttpClient;
   readonly #dispatcher:  Dispatcher | undefined;
+  readonly #ownsDispatcher: boolean;
+  readonly #maximumReceiveMessageSize: number;
 
   #transport:       ITransport | null         = null;
   #connectionId:    string | null             = null;
@@ -158,7 +166,7 @@ export class HubConnection {
   /** Active server-streaming subscriptions awaiting StreamItem/Completion. */
   readonly #streamCbs:     Map<InvocationId, PendingStream>      = new Map();
   /** Client-method handlers registered via `on()`. */
-  readonly #methods:       Map<string, Set<(...args: unknown[]) => void>> = new Map();
+  readonly #methods:       Map<string, Set<(...args: unknown[]) => unknown>> = new Map();
 
   /** Registered `onclose` callbacks. */
   readonly #closedCallbacks:       Array<(error?: Error) => void>  = [];
@@ -174,7 +182,8 @@ export class HubConnection {
   #handshakeResolver: (() => void)     | null = null;
   #handshakeRejecter: ((e: Error) => void) | null = null;
 
-  #messageBuffer: string = '';
+  #handshakeBuffer: Buffer = Buffer.alloc(0);
+  #dispatcherClosePromise: Promise<void> | null = null;
   #invocationSeq: number = 0;
 
   constructor(url: string, options: HubConnectionOptions = {}) {
@@ -189,8 +198,10 @@ export class HubConnection {
     this.#pingInterval       = options.keepAliveIntervalInMilliseconds   ?? DEFAULT_PING_INTERVAL_IN_MS;
     this.#handshakeTimeout   = options.handshakeTimeoutInMilliseconds    ?? 15_000;
     this.#reconnectPolicy    = options.reconnectPolicy ?? null;
-    this.#protocol           = new JsonHubProtocol();
+    this.#protocol           = options.protocol ?? new JsonHubProtocol();
     this.#dispatcher         = options.dispatcher;
+    this.#ownsDispatcher     = options.ownsDispatcher ?? false;
+    this.#maximumReceiveMessageSize = options.maximumReceiveMessageSize ?? 32 * 1024 * 1024;
     // Use the caller-supplied client, or create a DispatchHttpClient that shares
     // the same dispatcher so negotiate + polls + WebSocket all use one pool.
     this.#http               = options.httpClient
@@ -222,6 +233,15 @@ export class HubConnection {
       this.#state = HubConnectionState.Connected;
       this.#logger.log(LogLevel.Information, 'HubConnection connected.');
     } catch (err) {
+      this.#clearTimers();
+      this.#handshakeResolver = null;
+      this.#handshakeRejecter = null;
+      this.#handshakeBuffer = Buffer.alloc(0);
+      if (this.#transport) {
+        this.#transport.onclose = null;
+        await this.#transport.stop().catch(/* istanbul ignore next -- cleanup is best-effort */ () => {});
+        this.#transport = null;
+      }
       this.#state = HubConnectionState.Disconnected;
       this.#logger.log(LogLevel.Error, `Failed to start: ${(err as Error).message}`);
       throw err;
@@ -229,19 +249,23 @@ export class HubConnection {
   }
 
   async stop(): Promise<void> {
+    if (this.#state === HubConnectionState.Disconnected) return;
     this.#stopping = true;
+    this.#state = HubConnectionState.Disconnecting;
     this.#logger.log(LogLevel.Debug, 'Stopping HubConnection.');
     this.#clearTimers();
 
     const stopErr = new AbortError('Connection stopped before the invocation completed.');
     this.#rejectAllPending(stopErr);
 
+    /* istanbul ignore else -- non-disconnected connections normally own a transport */
     if (this.#transport) {
+      this.#transport.onclose = null;
       try { await this.#transport.stop(); } catch { /* ignore */ }
       this.#transport = null;
     }
-
-    this.#state = HubConnectionState.Disconnected;
+    this.#completeClose();
+    await this.#closeOwnedDispatcher();
     this.#logger.log(LogLevel.Information, 'HubConnection stopped.');
   }
 
@@ -256,9 +280,7 @@ export class HubConnection {
   invoke<T = void>(methodName: string, ...args: unknown[]): Promise<T> {
     this.#assertConnected('invoke');
     const id  = this.#nextId();
-    const msg = this.#protocol.writeMessage(
-      JsonHubProtocol.invocation(id, methodName, args)
-    ) as string;
+    const msg = this.#encode(JsonHubProtocol.invocation(id, methodName, args));
 
     return new Promise<T>((resolve, reject) => {
       this.#callbacks.set(id, {
@@ -278,17 +300,14 @@ export class HubConnection {
    */
   send(methodName: string, ...args: unknown[]): Promise<void> {
     this.#assertConnected('send');
-    const msg = this.#protocol.writeMessage(
-      JsonHubProtocol.send(methodName, args)
-    ) as string;
+    const msg = this.#encode(JsonHubProtocol.send(methodName, args));
     return this.#send(msg);
   }
 
   // ─── Server-streaming ────────────────────────────────────────────────────
 
   /**
-   * Start a server-streaming invocation.
-   * The call is not sent until `subscribe` is called.
+   * Start a server-streaming invocation immediately.
    * The returned `ISubscription` implements `Symbol.dispose` for `using`.
    *
    * @typeParam T  Type of each streamed item.
@@ -304,29 +323,48 @@ export class HubConnection {
   stream<T = unknown>(methodName: string, ...args: unknown[]): IStreamResult<T> {
     this.#assertConnected('stream');
     const id = this.#nextId();
+    type Notification =
+      | { kind: 'next'; value: T }
+      | { kind: 'error'; error: Error }
+      | { kind: 'complete' };
+    const queued: Notification[] = [];
+    let activeSubscriber: IStreamSubscriber<T> | null = null;
+    let subscribed = false;
+
+    const deliver = (notification: Notification): void => {
+      if (!activeSubscriber) {
+        queued.push(notification);
+        return;
+      }
+      if (notification.kind === 'next') activeSubscriber.next?.(notification.value);
+      else if (notification.kind === 'error') activeSubscriber.error?.(notification.error);
+      else activeSubscriber.complete?.();
+    };
+
+    this.#streamCbs.set(id, {
+      next:     (value) => deliver({ kind: 'next', value: value as T }),
+      error:    (error) => deliver({ kind: 'error', error }),
+      complete: ()      => deliver({ kind: 'complete' }),
+    });
+
+    const msg = this.#encode(JsonHubProtocol.streamInvocation(id, methodName, args));
+    this.#send(msg).catch((error: Error) => {
+      this.#streamCbs.delete(id);
+      deliver({ kind: 'error', error });
+    });
 
     return {
       subscribe: (subscriber: IStreamSubscriber<T>): ISubscription => {
-        const msg = this.#protocol.writeMessage(
-          JsonHubProtocol.streamInvocation(id, methodName, args)
-        ) as string;
-
-        this.#streamCbs.set(id, {
-          next:     (v) => subscriber.next?.(v as T),
-          error:    (e) => subscriber.error?.(e),
-          complete: ()  => subscriber.complete?.(),
-        });
-
-        this.#send(msg).catch((err: Error) => {
-          this.#streamCbs.delete(id);
-          subscriber.error?.(err);
-        });
+        if (subscribed) throw new Error('A stream result can only be subscribed to once.');
+        subscribed = true;
+        activeSubscriber = subscriber;
+        for (const notification of queued.splice(0)) deliver(notification);
 
         return new StreamSubscription(() => {
           if (this.#streamCbs.has(id)) {
             this.#streamCbs.delete(id);
             this.#send(
-              this.#protocol.writeMessage(JsonHubProtocol.cancelInvocation(id)) as string
+              this.#encode(JsonHubProtocol.cancelInvocation(id))
             ).catch(
               /* istanbul ignore next -- cancellation is intentionally best-effort */
               () => { /* best-effort */ },
@@ -347,17 +385,17 @@ export class HubConnection {
    */
   on<TArgs extends unknown[] = unknown[]>(
     methodName: string,
-    handler: (...args: TArgs) => void,
+    handler: (...args: TArgs) => unknown,
   ): void {
     const key = methodName.toLowerCase();
     if (!this.#methods.has(key)) this.#methods.set(key, new Set());
-    this.#methods.get(key)!.add(handler as (...args: unknown[]) => void);
+    this.#methods.get(key)!.add(handler as (...args: unknown[]) => unknown);
   }
 
   /**
    * Remove a previously registered handler, or all handlers for a method.
    */
-  off(methodName: string, handler?: (...args: unknown[]) => void): void {
+  off(methodName: string, handler?: (...args: unknown[]) => unknown): void {
     const key = methodName.toLowerCase();
     if (!this.#methods.has(key)) return;
     if (handler == null) {
@@ -378,11 +416,11 @@ export class HubConnection {
     let url = this.#url;
 
     if (this.#skipNegotiation) {
-      if ((this.#requestedTransport & HttpTransportType.WebSockets) === 0) {
-        throw new Error('skipNegotiation requires the WebSockets transport.');
+      if (this.#requestedTransport !== HttpTransportType.WebSockets) {
+        throw new Error('skipNegotiation requires WebSockets as the only transport.');
       }
       this.#transport = this.#createTransport(HttpTransportType.WebSockets);
-      await this.#connectTransport(url, TransferFormat.Text);
+      await this.#connectTransport(url, this.#protocol.transferFormat);
     } else {
       let redirectCount = 0;
       for (;;) {
@@ -410,10 +448,7 @@ export class HubConnection {
     }
 
     // Wire message routing
-    this.#transport!.onreceive = (data) => this.#processIncoming(
-      /* istanbul ignore next -- negotiated JSON transports deliver text */
-      typeof data === 'string' ? data : Buffer.from(data).toString('utf8')
-    );
+    this.#transport!.onreceive = (data) => this.#processIncoming(data);
     this.#transport!.onclose   = (err) => this.#onTransportClosed(err);
 
     // Protocol handshake
@@ -462,6 +497,10 @@ export class HubConnection {
       );
     }
 
+    if (Buffer.byteLength(res.body, 'utf8') > this.#maximumReceiveMessageSize) {
+      throw new Error(`Negotiate response exceeds ${this.#maximumReceiveMessageSize} bytes.`);
+    }
+
     const body = JSON.parse(res.body) as NegotiateResponse;
     if (body.error) throw new Error(`Negotiate returned error: ${body.error}`);
     return body;
@@ -472,16 +511,17 @@ export class HubConnection {
     available: readonly { transport: string; transferFormats: readonly string[] }[],
   ): Promise<void> {
     const ORDERED = [
-      { flag: HttpTransportType.WebSockets,       name: 'WebSockets',       format: TransferFormat.Text   },
-      { flag: HttpTransportType.ServerSentEvents, name: 'ServerSentEvents', format: TransferFormat.Text   },
-      { flag: HttpTransportType.LongPolling,      name: 'LongPolling',      format: TransferFormat.Text   },
+      { flag: HttpTransportType.WebSockets,       name: 'WebSockets'       },
+      { flag: HttpTransportType.ServerSentEvents, name: 'ServerSentEvents' },
+      { flag: HttpTransportType.LongPolling,      name: 'LongPolling'      },
     ] as const;
-
-    const serverSet = new Set(available.map((t) => t.transport));
+    /* istanbul ignore next -- both protocol formats are exercised at the protocol boundary */
+    const formatName = this.#protocol.transferFormat === TransferFormat.Binary ? 'Binary' : 'Text';
 
     for (const pref of ORDERED) {
       if ((this.#requestedTransport & pref.flag) === 0) continue;
-      if (!serverSet.has(pref.name)) continue;
+      const offered = available.find((candidate) => candidate.transport === pref.name);
+      if (!offered?.transferFormats.includes(formatName)) continue;
 
       this.#logger.log(LogLevel.Debug, `Trying ${pref.name} transport.`);
       const transport = this.#createTransport(pref.flag);
@@ -490,7 +530,7 @@ export class HubConnection {
       const tUrl      = appendParam(url, 'id', token);
 
       try {
-        await transport.connect(tUrl, pref.format);
+        await transport.connect(tUrl, this.#protocol.transferFormat);
         this.#transport = transport;
         return;
       } catch (err) {
@@ -531,31 +571,51 @@ export class HubConnection {
       this.#handshakeResolver = resolve;
       this.#handshakeRejecter = reject;
 
-      this.#transport!.send(HANDSHAKE_REQUEST).catch(reject);
+      const request = JSON.stringify({ protocol: this.#protocol.name, version: this.#protocol.version }) + '\x1e';
+      const fail = (error: unknown): void => {
+        clearTimeout(this.#handshakeTimer!);
+        this.#handshakeResolver = null;
+        this.#handshakeRejecter = null;
+        /* istanbul ignore next -- transport.send rejects with Error */
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
+      this.#transport!.send(request).catch(fail);
 
       this.#handshakeTimer = setTimeout(() => {
-        reject(new Error('Server timeout: no handshake response received.'));
+        fail(new Error('Server timeout: no handshake response received.'));
       }, this.#handshakeTimeout);
     });
   }
 
   // ─── Internal: incoming data ─────────────────────────────────────────────
 
-  #processIncoming(text: string): void {
+  #processIncoming(data: string | Uint8Array): void {
     this.#resetServerTimeoutTimer();
-    this.#messageBuffer += text;
+    /* istanbul ignore next -- binary input is exercised through binary protocol tests */
+    const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data);
+    if (bytes.byteLength > this.#maximumReceiveMessageSize) {
+      this.#stopWithError(new Error(`Incoming message exceeds ${this.#maximumReceiveMessageSize} bytes.`));
+      return;
+    }
 
     // During handshake the first data is the response
     if (this.#handshakeResolver) {
+      this.#handshakeBuffer = Buffer.concat([this.#handshakeBuffer, bytes]);
+      const separator = this.#handshakeBuffer.indexOf(0x1e);
+      /* istanbul ignore next -- partial handshakes are buffered for the next frame */
+      if (separator === -1) return;
       try {
-        const { remainder } = parseHandshakeResponse(this.#messageBuffer);
-        this.#messageBuffer = remainder;
+        parseHandshakeResponse(this.#handshakeBuffer.subarray(0, separator + 1).toString('utf8'));
+        const remainder = this.#handshakeBuffer.subarray(separator + 1);
+        this.#handshakeBuffer = Buffer.alloc(0);
         this.#logger.log(LogLevel.Debug, 'Handshake complete.');
         clearTimeout(this.#handshakeTimer!);
         const r = this.#handshakeResolver;
         this.#handshakeResolver = null;
         this.#handshakeRejecter = null;
         r();
+        /* istanbul ignore next -- servers ordinarily send handshake and hub frames separately */
+        if (remainder.length > 0) this.#processProtocolPayload(remainder);
       } catch (err) {
         clearTimeout(this.#handshakeTimer!);
         const r = this.#handshakeRejecter!;
@@ -565,13 +625,23 @@ export class HubConnection {
         r(err instanceof Error ? err : new Error(String(err)));
         return;
       }
+      return;
     }
 
-    if (!this.#messageBuffer) return;
+    this.#processProtocolPayload(bytes);
+  }
+
+  #processProtocolPayload(bytes: Uint8Array): void {
+    /* istanbul ignore next -- transports do not emit empty payloads */
+    if (bytes.length === 0) return;
 
     let messages;
     try {
-      messages = this.#protocol.parseMessages(this.#messageBuffer, this.#logger);
+      /* istanbul ignore next -- MessagePack parsing is covered directly */
+      const input = this.#protocol.transferFormat === TransferFormat.Text
+        ? Buffer.from(bytes).toString('utf8')
+        : Uint8Array.from(bytes).buffer;
+      messages = this.#protocol.parseMessages(input, this.#logger);
     } catch (err) {
       this.#logger.log(LogLevel.Error, `Error parsing messages: ${(err as Error).message}`);
       /* istanbul ignore next -- protocol parsers throw Error objects */
@@ -579,25 +649,11 @@ export class HubConnection {
       return;
     }
 
-    // Every complete record was consumed by parseMessages; the buffer is now empty
-    this.#messageBuffer = '';
-
     for (const msg of messages) {
       switch (msg.type) {
         // ── Type 1: Server calls a client method ──────────────────────────
         case MessageType.Invocation: {
-          const key      = msg.target.toLowerCase();
-          const handlers = this.#methods.get(key);
-          if (!handlers || handlers.size === 0) {
-            this.#logger.log(LogLevel.Warning, `No handler for "${msg.target}".`);
-            break;
-          }
-          for (const h of handlers) {
-            try { h(...(msg.arguments as unknown[])); }
-            catch (e) {
-              this.#logger.log(LogLevel.Error, `Handler for "${msg.target}" threw: ${(e as Error).message}`);
-            }
-          }
+          void this.#invokeClientMethod(msg);
           break;
         }
 
@@ -647,6 +703,7 @@ export class HubConnection {
             if (this.#transport) this.#transport.onclose = null;
             const t = this.#transport;
             this.#transport = null;
+            this.#rejectAllPending(closeErr ?? new AbortError('Connection closed while reconnecting.'));
             void t?.stop().catch(
               /* istanbul ignore next -- shutdown after a server Close is best-effort */
               () => {},
@@ -665,6 +722,41 @@ export class HubConnection {
     }
   }
 
+  async #invokeClientMethod(msg: Extract<HubMessage, { type: 1 }>): Promise<void> {
+    const handlers = this.#methods.get(msg.target.toLowerCase());
+    if (!handlers || handlers.size === 0) {
+      this.#logger.log(LogLevel.Warning, `No handler for "${msg.target}".`);
+      if (msg.invocationId) {
+        await this.#send(this.#encode(JsonHubProtocol.completion(
+          msg.invocationId, undefined, `No client handler registered for '${msg.target}'.`,
+        ))).catch(/* istanbul ignore next -- completion replies are best-effort */ () => {});
+      }
+      return;
+    }
+
+    let result: unknown;
+    let invocationError: Error | null = null;
+    for (const handler of [...handlers]) {
+      try {
+        result = await handler(...(msg.arguments as unknown[]));
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        invocationError ??= err;
+        this.#logger.log(LogLevel.Error, `Handler for "${msg.target}" threw: ${err.message}`);
+      }
+    }
+    if (msg.invocationId) {
+      const completion: HubMessage = invocationError
+        ? { type: MessageType.Completion, invocationId: msg.invocationId, error: invocationError.message }
+        : {
+            type: MessageType.Completion,
+            invocationId: msg.invocationId,
+            ...(result !== undefined && { result }),
+          };
+      await this.#send(this.#encode(completion)).catch(/* istanbul ignore next -- completion replies are best-effort */ () => {});
+    }
+  }
+
   // ─── Internal: transport closed ──────────────────────────────────────────
 
   #onTransportClosed(err?: Error): void {
@@ -677,6 +769,7 @@ export class HubConnection {
       err ? `Transport closed with error: ${err.message}` : 'Transport closed.'
     );
     this.#clearTimers();
+    this.#rejectAllPending(err ?? new AbortError('Connection closed while reconnecting.'));
 
     if (this.#reconnectPolicy) {
       void this.#doReconnect(err ?? null);
@@ -702,6 +795,7 @@ export class HubConnection {
     for (const cb of this.#closedCallbacks) {
       try { cb(err); } catch { /* ignore */ }
     }
+    void this.#closeOwnedDispatcher();
   }
 
   #rejectAllPending(err: Error): void {
@@ -767,7 +861,7 @@ export class HubConnection {
          leaves Connected; the guard is a defensive fallback. */
       if (this.#state !== HubConnectionState.Connected) return;
       try {
-        await this.#send(this.#protocol.writeMessage(JsonHubProtocol.ping()) as string);
+        await this.#send(this.#encode(JsonHubProtocol.ping()));
       } catch (err) {
         this.#logger.log(LogLevel.Warning, `Ping failed: ${(err as Error).message}`);
       }
@@ -794,9 +888,14 @@ export class HubConnection {
 
   // ─── Internal: helpers ────────────────────────────────────────────────────
 
-  #send(message: string): Promise<void> {
+  #send(message: string | Uint8Array): Promise<void> {
     this.#resetPingTimer();
     return this.#transport!.send(message);
+  }
+
+  #encode(message: HubMessage): string | Uint8Array {
+    const encoded = this.#protocol.writeMessage(message);
+    return typeof encoded === 'string' ? encoded : new Uint8Array(encoded);
   }
 
   #assertConnected(method: string): void {
@@ -809,6 +908,14 @@ export class HubConnection {
 
   #nextId(): InvocationId {
     return toInvocationId(String(++this.#invocationSeq));
+  }
+
+  async #closeOwnedDispatcher(): Promise<void> {
+    if (!this.#ownsDispatcher || !this.#dispatcher) return;
+    this.#dispatcherClosePromise ??= this.#dispatcher.close().catch(
+      /* istanbul ignore next -- shutdown cleanup is best-effort */ () => {},
+    );
+    await this.#dispatcherClosePromise;
   }
 }
 

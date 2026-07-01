@@ -9,5 +9,13 @@
     "rootDir": ".",
     "noEmit": true
   },
-  "include": ["src/**/*", "tests/**/*"]
+  "include": [
+    "src/**/*",
+    "tests/unit/**/*",
+    "tests/helpers/**/*",
+    "tests/bench/**/*"
+  ],
+  /* Package-consumer fixtures import through package.json exports and require
+     a completed build. They are checked separately by typecheck:package. */
+  "exclude": ["tests/types/**/*"]
 }

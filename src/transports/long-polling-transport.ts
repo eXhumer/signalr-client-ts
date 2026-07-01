@@ -13,6 +13,7 @@
 import type { IHttpClient } from '../interfaces.js';
 import { TransferFormat, LogLevel } from '../constants.js';
 import type { ITransport, ILogger } from '../interfaces.js';
+import type { Readable } from 'node:stream';
 
 /** How long a single poll GET can hang before we issue a new one. */
 const POLL_TIMEOUT_MS = 100_000;
@@ -28,6 +29,8 @@ export class LongPollingTransport implements ITransport {
   #url:           string | null = null;
   #running:       boolean       = false;
   #pollImmediate: ReturnType<typeof setImmediate> | null = null;
+  #activeAbort:   (() => void) | null = null;
+  #transferFormat: TransferFormat = TransferFormat.Text;
 
   onreceive: ((data: string | Uint8Array) => void) | null = null;
   onclose:   ((error?: Error) => void)             | null = null;
@@ -44,10 +47,11 @@ export class LongPollingTransport implements ITransport {
     this.#extraHeaders       = extraHeaders;
   }
 
-  async connect(url: string, _transferFormat: TransferFormat): Promise<void> {
+  async connect(url: string, transferFormat: TransferFormat): Promise<void> {
     this.#logger.log(LogLevel.Trace, `(LongPolling transport) Connecting to ${url}.`);
     this.#url     = url;
     this.#running = true;
+    this.#transferFormat = transferFormat;
 
     // Validate the connection with an initial poll
     await this.#poll(url, /* isConnect */ true);
@@ -68,8 +72,7 @@ export class LongPollingTransport implements ITransport {
         : 'application/octet-stream',
     });
 
-    const body   = typeof data === 'string' ? data : Buffer.from(data).toString('binary');
-    const result = await this.#httpClient.post(this.#url, { headers, body });
+    const result = await this.#httpClient.post(this.#url, { headers, body: data });
 
     if (result.status < 200 || result.status >= 300) {
       throw new Error(`Long polling send failed with status ${result.status}.`);
@@ -83,6 +86,9 @@ export class LongPollingTransport implements ITransport {
       clearImmediate(this.#pollImmediate);
       this.#pollImmediate = null;
     }
+
+    this.#activeAbort?.();
+    this.#activeAbort = null;
 
     if (this.#url) {
       try {
@@ -134,22 +140,27 @@ export class LongPollingTransport implements ITransport {
 
     let res;
     try {
-      res = await this.#httpClient.get(url, { headers, timeout: POLL_TIMEOUT_MS });
+      res = await this.#httpClient.stream('GET', url, { headers, timeout: POLL_TIMEOUT_MS });
+      this.#activeAbort = res.abort;
     } catch (err) {
       if (!this.#running) return; // normal stop - swallow
       throw err;
     }
 
-    if (res.status === 204) {
+    if (res.statusCode === 204) {
       // Server ended connection gracefully
+      await readAll(res.body);
+      this.#activeAbort = null;
       this.#logger.log(LogLevel.Information, '(LongPolling transport) Server closed (204).');
       this.#running = false;
       this.onclose?.();
       return;
     }
 
-    if (res.status < 200 || res.status >= 300) {
-      const err = new Error(`Long polling received unexpected status ${res.status}.`);
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      await readAll(res.body);
+      this.#activeAbort = null;
+      const err = new Error(`Long polling received unexpected status ${res.statusCode}.`);
       if (!isConnect) {
         this.#running = false;
         this.onclose?.(err);
@@ -159,9 +170,23 @@ export class LongPollingTransport implements ITransport {
       return;
     }
 
-    if (res.body.length > 0) {
-      this.#logger.log(LogLevel.Trace, `(LongPolling transport) Received: ${res.body}`);
-      this.onreceive?.(res.body);
+    let body: Buffer;
+    try {
+      body = await readAll(res.body);
+    } catch (err) {
+      /* istanbul ignore next -- only an explicit stop aborts the active body */
+      if (!this.#running) return;
+      /* istanbul ignore next -- body errors are propagated to the poll loop */
+      throw err;
+    } finally {
+      this.#activeAbort = null;
+    }
+    if (body.length > 0) {
+      const data = this.#transferFormat === TransferFormat.Binary
+        ? new Uint8Array(body.buffer, body.byteOffset, body.byteLength)
+        : body.toString('utf8');
+      this.#logger.log(LogLevel.Trace, `(LongPolling transport) Received ${body.length} bytes.`);
+      this.onreceive?.(data);
     }
   }
 
@@ -173,4 +198,16 @@ export class LongPollingTransport implements ITransport {
     }
     return headers;
   }
+}
+
+function readAll(stream: Readable): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    stream.on('data', (chunk: Buffer | string) => {
+      /* istanbul ignore next -- Node HTTP response streams emit Buffer chunks */
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
+  });
 }

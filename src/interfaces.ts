@@ -50,7 +50,7 @@ export interface ITransport {
 
 // ─── Hub Protocol ─────────────────────────────────────────────────────────────
 
-/** Wire-protocol codec (JSON today; MessagePack can be added as an alternate). */
+/** Wire-protocol codec used by a HubConnection. */
 export interface IHubProtocol {
   readonly name:           string;
   readonly version:        number;
@@ -103,8 +103,7 @@ export interface ISubscription {
 }
 
 /**
- * Lazy stream result - the server-streaming call is not sent until
- * `subscribe` is called.
+ * A running server-streaming invocation. It supports one subscriber.
  */
 export interface IStreamResult<T> {
   subscribe(subscriber: IStreamSubscriber<T>): ISubscription;

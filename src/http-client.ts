@@ -56,7 +56,7 @@ export interface RequestOptions {
    * Plain objects are serialised to JSON automatically.
    * Strings are sent as-is (set Content-Type explicitly if needed).
    */
-  readonly body?:    string | Record<string, unknown> | null;
+  readonly body?:    string | Uint8Array | Record<string, unknown> | null;
   /** Override the session-level timeout for this single request (ms). */
   readonly timeout?: number;
 }
@@ -83,6 +83,8 @@ export interface HttpClientOptions {
    * is used, which is undici's default `Agent`.
    */
   readonly dispatcher?: Dispatcher;
+  /** Maximum buffered response body size in bytes (default: 32 MiB). */
+  readonly maximumResponseBodySize?: number;
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -93,9 +95,12 @@ export interface HttpClientOptions {
  * header automatically.
  */
 function prepareBody(
-  body: string | Record<string, unknown> | null | undefined,
+  body: string | Uint8Array | Record<string, unknown> | null | undefined,
 ): { buf: Buffer | null; inferredContentType: string | null } {
   if (body == null) return { buf: null, inferredContentType: null };
+  if (body instanceof Uint8Array) {
+    return { buf: Buffer.from(body.buffer, body.byteOffset, body.byteLength), inferredContentType: null };
+  }
   if (typeof body === 'string') {
     return { buf: Buffer.from(body, 'utf8'), inferredContentType: null };
   }
@@ -138,6 +143,12 @@ function normaliseHeaders(
   return h as Record<string, string | string[] | undefined>;
 }
 
+function assertBodySize(size: number, maximum: number): void {
+  if (size > maximum) {
+    throw new Error(`HTTP response body exceeds the ${maximum} byte limit.`);
+  }
+}
+
 // ─── Abstract base ────────────────────────────────────────────────────────────
 
 /**
@@ -156,11 +167,13 @@ abstract class BaseUndiciClient implements IHttpClient {
    * Defaults to undici's process-global agent when not specified.
    */
   protected readonly dispatcher: Dispatcher;
+  protected readonly maximumResponseBodySize: number;
 
   constructor(options: HttpClientOptions = {}) {
     this.defaultHeaders = options.headers    ?? {};
     this.defaultTimeout = options.timeout    ?? 30_000;
     this.dispatcher     = options.dispatcher ?? getGlobalDispatcher();
+    this.maximumResponseBodySize = options.maximumResponseBodySize ?? 32 * 1024 * 1024;
   }
 
   // Convenience wrappers ──────────────────────────────────────────────────────
@@ -235,6 +248,7 @@ export class RequestHttpClient extends BaseUndiciClient {
     });
 
     const text = await body.text();
+    assertBodySize(Buffer.byteLength(text), this.maximumResponseBodySize);
 
     return {
       status:  statusCode,
@@ -326,6 +340,7 @@ export class FetchHttpClient extends BaseUndiciClient {
       } as unknown as Parameters<typeof undiciFetch>[1]);
 
       const text = await res.text();
+      assertBodySize(Buffer.byteLength(text), this.maximumResponseBodySize);
       if (timer !== null) clearTimeout(timer);
 
       // Convert Headers object to plain Record
@@ -431,7 +446,11 @@ export class StreamHttpClient extends BaseUndiciClient {
     ).then(() => ({
       status:  statusCode,
       headers: normaliseHeaders(respHeaders),
-      body:    Buffer.concat(chunks).toString('utf8'),
+      body:    (() => {
+        const body = Buffer.concat(chunks);
+        assertBodySize(body.length, this.maximumResponseBodySize);
+        return body.toString('utf8');
+      })(),
     }));
   }
 
@@ -542,7 +561,11 @@ export class PipelineHttpClient extends BaseUndiciClient {
         resolve({
           status:  statusCode,
           headers: normaliseHeaders(respHeaders),
-          body:    Buffer.concat(chunks).toString('utf8'),
+          body:    (() => {
+            const body = Buffer.concat(chunks);
+            assertBodySize(body.length, this.maximumResponseBodySize);
+            return body.toString('utf8');
+          })(),
         }),
       );
       duplex.on('error', reject);
@@ -651,11 +674,19 @@ export class DispatchHttpClient extends BaseUndiciClient {
       let statusCode  = 0;
       let respHeaders: Record<string, string | string[] | undefined> = {};
       const chunks: Buffer[] = [];
+      let responseSize = 0;
+      let controller: Dispatcher.DispatchController | null = null;
+      let settled = false;
 
       let timer: ReturnType<typeof setTimeout> | null = null;
       if (timeout > 0) {
         timer = setTimeout(() => {
-          reject(new Error(`HTTP request timed out after ${timeout} ms`));
+          /* istanbul ignore next -- timer is cleared on every settled path */
+          if (settled) return;
+          settled = true;
+          const error = new Error(`HTTP request timed out after ${timeout} ms`);
+          controller?.abort(error);
+          reject(error);
         }, timeout);
       }
 
@@ -672,12 +703,15 @@ export class DispatchHttpClient extends BaseUndiciClient {
           ...(buf !== null && { body: buf }),
         },
         {
-          onRequestStart: (_controller: Dispatcher.DispatchController, _context: unknown): void => {
-            // socket acquired; controller available for abort if needed
+          onRequestStart: (ctrl: Dispatcher.DispatchController, _context: unknown): void => {
+            controller = ctrl;
           },
 
           onResponseError: (_controller: Dispatcher.DispatchController, err: Error): void => {
             clearTimer();
+            /* istanbul ignore next -- undici does not end after reporting an error */
+            if (settled) return;
+            settled = true;
             reject(err);
           },
 
@@ -692,10 +726,17 @@ export class DispatchHttpClient extends BaseUndiciClient {
 
           onResponseData: (_controller: Dispatcher.DispatchController, chunk: Buffer): void => {
             chunks.push(Buffer.from(chunk));
+            responseSize += chunk.length;
+            if (responseSize > this.maximumResponseBodySize) {
+              _controller.abort(new Error(`HTTP response body exceeds the ${this.maximumResponseBodySize} byte limit.`));
+            }
           },
 
           onResponseEnd: (_controller: Dispatcher.DispatchController, _trailers: Record<string, string | string[] | undefined>): void => {
             clearTimer();
+            /* istanbul ignore next -- undici does not end after reporting an error */
+            if (settled) return;
+            settled = true;
             resolve({
               status:  statusCode,
               headers: respHeaders,
@@ -775,7 +816,10 @@ export class DispatchHttpClient extends BaseUndiciClient {
           },
 
           onResponseData: (_ctrl: Dispatcher.DispatchController, chunk: Buffer): void => {
-            pt.write(chunk);
+            if (!pt.write(chunk)) {
+              controller?.pause();
+              pt.once('drain', () => controller?.resume());
+            }
           },
 
           onResponseEnd: (_ctrl: Dispatcher.DispatchController, _trailers: Record<string, string | string[] | undefined>): void => {

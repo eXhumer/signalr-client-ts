@@ -435,6 +435,41 @@ describe('MsgpackHubProtocol.parseMessages - validation errors', () => {
     expect(() => p.parseMessages(frame.buffer, log)).toThrow(/unexpected end of data/i);
   });
 
+  it('rejects a VarInt prefix longer than five bytes', () => {
+    expect(() => p.parseMessages(new Uint8Array([0x80, 0x80, 0x80, 0x80, 0x80]).buffer, log))
+      .toThrow(/longer than 5 bytes/i);
+  });
+
+  it('rejects a VarInt length above the SignalR 2 GB limit', () => {
+    expect(() => p.parseMessages(new Uint8Array([0xff, 0xff, 0xff, 0xff, 0x08]).buffer, log))
+      .toThrow(/2 GB/i);
+  });
+
+  it('rejects non-string invocation IDs', () => {
+    expect(() => p.parseMessages(rawFrame([2, {}, 42, 'item']), log)).toThrow(/invocationId/i);
+  });
+
+  it('rejects non-string stream IDs', () => {
+    expect(() => p.parseMessages(rawFrame([1, {}, 'id', 'Target', [], [1]]), log)).toThrow(/streamIds/i);
+  });
+
+  it('rejects non-string header values', () => {
+    expect(() => p.parseMessages(rawFrame([5, { bad: 1 }, 'id']), log)).toThrow(/headers/i);
+  });
+
+  it('rejects a non-boolean allowReconnect value', () => {
+    expect(() => p.parseMessages(rawFrame([7, null, 'yes']), log)).toThrow(/allowReconnect/i);
+  });
+
+  it('preserves an explicit null completion result as NonVoid', () => {
+    const message: HubMessage = {
+      type: MessageType.Completion,
+      invocationId: toInvocationId('null-result'),
+      result: null,
+    };
+    expect((roundtrip(message) as { result?: unknown }).result).toBeNull();
+  });
+
   // ── Headers branch coverage ───────────────────────────────────────────────
 
   it('StreamInvocation with non-empty headers preserves them (line 362)', () => {

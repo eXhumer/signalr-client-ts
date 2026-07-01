@@ -399,4 +399,28 @@ describe('JsonHubProtocol.parseMessages - required-field validation (protocol co
     expect(msgs[0]!.type).toBe(MessageType.StreamInvocation);
     expect((msgs[0] as { headers?: Record<string, string> }).headers?.['x-si']).toBe('ok');
   });
+
+  it('rejects non-string invocation IDs', () => {
+    expect(() => p.parseMessages(`{"type":2,"invocationId":42,"item":1}${RS}`, log))
+      .toThrow(/invocationId/i);
+  });
+
+  it('rejects non-string stream IDs', () => {
+    expect(() => p.parseMessages(`{"type":1,"target":"Foo","arguments":[],"streamIds":[1]}${RS}`, log))
+      .toThrow(/streamIds/i);
+  });
+
+  it('rejects invalid headers', () => {
+    expect(() => p.parseMessages(`{"type":5,"invocationId":"1","headers":{"bad":1}}${RS}`, log)).toThrow(/headers/i);
+  });
+
+  it('rejects a non-boolean allowReconnect value', () => {
+    expect(() => p.parseMessages(`{"type":7,"allowReconnect":"yes"}${RS}`, log))
+      .toThrow(/allowReconnect/i);
+  });
+
+  it('preserves an explicit null completion result', () => {
+    const [message] = p.parseMessages(`{"type":3,"invocationId":"1","result":null}${RS}`, log);
+    expect((message as { result?: unknown }).result).toBeNull();
+  });
 });

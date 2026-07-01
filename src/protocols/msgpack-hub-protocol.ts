@@ -96,6 +96,12 @@ function readVarInt(data: Uint8Array, offset: number): { value: number; bytesRea
     }
     const byte = data[offset + bytesRead]!;
     hasMore = (byte & 0x80) !== 0;
+    if (bytesRead === 4 && hasMore) {
+      throw new Error('MessagePack: VarInt frame length prefix is longer than 5 bytes.');
+    }
+    if (bytesRead === 4 && byte > 0x07) {
+      throw new Error('MessagePack: VarInt frame length exceeds the 2 GB SignalR limit.');
+    }
     value  |= (byte & 0x7f) << shift;
     shift  += 7;
     bytesRead++;
@@ -191,7 +197,7 @@ export class MsgpackHubProtocol implements IHubProtocol {
 
       case MessageType.Completion: {
         const hasError  = message.error  != null;
-        const hasResult = message.result != null;
+        const hasResult = Object.prototype.hasOwnProperty.call(message, 'result');
         if (hasError) {
           return pack([
             MessageType.Completion,
@@ -289,13 +295,14 @@ export class MsgpackHubProtocol implements IHubProtocol {
     const rawId     = arr[2];
     const rawSids   = arr[5];
     const rawHdrs   = arr[1];
+    const streamIds = rawSids == null ? [] : parseStreamIds(rawSids);
     return {
       type:      MessageType.Invocation,
       target,
       arguments: args as unknown[],
-      ...(rawId != null && rawId !== '' && rawId !== null && { invocationId: toInvocationId(String(rawId)) }),
-      ...(Array.isArray(rawSids) && rawSids.length > 0                && { streamIds: rawSids as string[] }),
-      ...(isNonEmptyObject(rawHdrs)                                   && { headers:   rawHdrs as Record<string, string> }),
+      ...(rawId != null && rawId !== '' && { invocationId: parseInvocationId(rawId) }),
+      ...(streamIds.length > 0 && { streamIds }),
+      ...(isNonEmptyObject(rawHdrs) && { headers: parseHeaders(rawHdrs) }),
     };
   }
 
@@ -308,9 +315,9 @@ export class MsgpackHubProtocol implements IHubProtocol {
     }
     return {
       type:         MessageType.StreamItem,
-      invocationId: toInvocationId(String(rawId)),
+      invocationId: parseInvocationId(rawId),
       item:         arr[3],
-      ...(isNonEmptyObject(arr[1]) && { headers: arr[1] as Record<string, string> }),
+      ...(isNonEmptyObject(arr[1]) && { headers: parseHeaders(arr[1]) }),
     };
   }
 
@@ -321,9 +328,9 @@ export class MsgpackHubProtocol implements IHubProtocol {
     if (rawId == null) {
       throw new Error("Invalid Completion message: index 2 ('invocationId') is required.");
     }
-    const invocationId = toInvocationId(String(rawId));
+    const invocationId = parseInvocationId(rawId);
     const resultKind   = arr[3] as ResultKindValue;
-    const hdrs         = isNonEmptyObject(arr[1]) ? { headers: arr[1] as Record<string, string> } : {};
+    const hdrs         = isNonEmptyObject(arr[1]) ? { headers: parseHeaders(arr[1]) } : {};
 
     switch (resultKind) {
       case ResultKind.Error:
@@ -353,13 +360,14 @@ export class MsgpackHubProtocol implements IHubProtocol {
       throw new Error("Invalid StreamInvocation message: index 4 ('arguments') must be an array.");
     }
     const rawSids = arr[5];
+    const streamIds = rawSids == null ? [] : parseStreamIds(rawSids);
     return {
       type:         MessageType.StreamInvocation,
-      invocationId: toInvocationId(String(rawId)),
+      invocationId: parseInvocationId(rawId),
       target,
       arguments:    args as unknown[],
-      ...(Array.isArray(rawSids) && rawSids.length > 0   && { streamIds: rawSids as string[] }),
-      ...(isNonEmptyObject(arr[1])                        && { headers: arr[1] as Record<string, string> }),
+      ...(streamIds.length > 0 && { streamIds }),
+      ...(isNonEmptyObject(arr[1]) && { headers: parseHeaders(arr[1]) }),
     };
   }
 
@@ -372,8 +380,8 @@ export class MsgpackHubProtocol implements IHubProtocol {
     }
     return {
       type:         MessageType.CancelInvocation,
-      invocationId: toInvocationId(String(rawId)),
-      ...(isNonEmptyObject(arr[1]) && { headers: arr[1] as Record<string, string> }),
+      invocationId: parseInvocationId(rawId),
+      ...(isNonEmptyObject(arr[1]) && { headers: parseHeaders(arr[1]) }),
     };
   }
 
@@ -384,10 +392,13 @@ export class MsgpackHubProtocol implements IHubProtocol {
   // ── [7, error|null, allowReconnect] ──────────────────────────────────
 
   #coerceClose(arr: unknown[]): CloseMessage {
+    if (arr[2] != null && typeof arr[2] !== 'boolean') {
+      throw new Error("Invalid Close message: index 2 ('allowReconnect') must be a boolean.");
+    }
     return {
       type: MessageType.Close,
       ...(arr[1] != null && { error:          String(arr[1])  }),
-      ...(arr[2] != null && { allowReconnect: Boolean(arr[2]) }),
+      ...(arr[2] != null && { allowReconnect: arr[2] }),
     };
   }
 
@@ -466,4 +477,23 @@ export class MsgpackHubProtocol implements IHubProtocol {
 function isNonEmptyObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v) &&
     Object.keys(v as object).length > 0;
+}
+
+function parseInvocationId(value: unknown): InvocationId {
+  if (typeof value !== 'string') throw new Error('Invalid MessagePack message: invocationId must be a string.');
+  return toInvocationId(value);
+}
+
+function parseStreamIds(value: unknown): string[] {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
+    throw new Error('Invalid MessagePack message: streamIds must be an array of strings.');
+  }
+  return value;
+}
+
+function parseHeaders(value: unknown): Record<string, string> {
+  if (!isNonEmptyObject(value) || !Object.values(value).every((entry) => typeof entry === 'string')) {
+    throw new Error('Invalid MessagePack message: headers must contain string values.');
+  }
+  return value as Record<string, string>;
 }

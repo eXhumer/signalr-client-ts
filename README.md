@@ -9,7 +9,7 @@ ASP.NET Core SignalR client for Node.js. HTTP and WebSocket layers are backed en
 
 ## Requirements
 
-- Node.js ≥ 22
+- Node.js ≥ 22.19.0
 - TypeScript ≥ 5.9 (for consumers using types)
 
 ## Installation
@@ -69,6 +69,12 @@ builder.withUrl('https://example.com/hub', {
 
   // How often to send a keep-alive ping to the server
   keepAliveIntervalInMilliseconds: 10_000, // default: 15 000
+
+  // How long to wait for the SignalR protocol handshake
+  handshakeTimeoutInMilliseconds: 15_000, // default: 15 000
+
+  // Reject an individual incoming transport payload above this size
+  maximumReceiveMessageSize: 32 * 1024 * 1024, // default: 32 MiB
 });
 ```
 
@@ -143,6 +149,20 @@ import { FetchHttpClient } from '@exhumer/signalr-client';
 builder.withHttpClient(new FetchHttpClient());
 ```
 
+### `.withHubProtocol(protocol)`
+
+Select the hub wire protocol. JSON is used by default; MessagePack provides a
+compact binary representation and requires server-side MessagePack support.
+
+```ts
+import { HubConnectionBuilder, MsgpackHubProtocol } from '@exhumer/signalr-client';
+
+const connection = new HubConnectionBuilder()
+  .withUrl('https://example.com/hub')
+  .withHubProtocol(new MsgpackHubProtocol())
+  .build();
+```
+
 ### `.build()`
 
 Returns a `HubConnection`. Throws if `.withUrl()` was never called.
@@ -197,6 +217,9 @@ sub.dispose();
 using sub = connection.stream<number>('Counter', 10).subscribe({ next: console.log });
 ```
 
+`stream()` sends the invocation immediately. Its result may be subscribed to
+once; items received before `subscribe()` are queued and delivered in order.
+
 ### Receiving hub method calls
 
 ```ts
@@ -204,6 +227,9 @@ using sub = connection.stream<number>('Counter', 10).subscribe({ next: console.l
 connection.on('ReceiveMessage', (user: string, msg: string) => {
   console.log(`${user}: ${msg}`);
 });
+
+// If the server requests a result, a handler's return value is sent back.
+connection.on('GetClientName', () => 'node-worker-1');
 
 // Remove a specific handler
 connection.off('ReceiveMessage', handler);
@@ -284,21 +310,29 @@ const connection = new HubConnectionBuilder()
 
 The library currently ships two hub protocol implementations.
 
-**JSON** (default, always active):
+**JSON** (default):
 
 ```ts
 import { JsonHubProtocol } from '@exhumer/signalr-client';
 ```
 
-`HubConnection` uses `JsonHubProtocol` internally - no configuration required.
+`HubConnection` uses `JsonHubProtocol` when no protocol is configured.
 
-**MessagePack** (optional):
+**MessagePack**:
 
 ```ts
-import { MsgpackHubProtocol } from '@exhumer/signalr-client';
+import { HubConnectionBuilder, MsgpackHubProtocol } from '@exhumer/signalr-client';
+
+const connection = new HubConnectionBuilder()
+  .withUrl('https://example.com/hub')
+  .withHubProtocol(new MsgpackHubProtocol())
+  .build();
 ```
 
-`MsgpackHubProtocol` is exported for custom transport/protocol use cases. It depends on `@msgpack/msgpack` which is a regular dependency of this package.
+The server must have the ASP.NET Core SignalR MessagePack protocol enabled.
+`MsgpackHubProtocol` depends on `@msgpack/msgpack`, which is a regular
+dependency of this package. Custom protocols can implement `IHubProtocol` and
+be supplied through the same builder method.
 
 ---
 
@@ -308,7 +342,7 @@ Five undici-backed HTTP client implementations are exported. The default (`Dispa
 
 | Export | Undici primitive | Notes |
 |---|---|---|
-| `DispatchHttpClient` | `Dispatcher#dispatch()` | Default. Also aliased as `HttpClient`. |
+| `DispatchHttpClient` | `Dispatcher#dispatch()` | Default; explicit pause/resume backpressure for streaming responses. Also aliased as `HttpClient`. |
 | `RequestHttpClient` | `undici.request()` | |
 | `FetchHttpClient` | `undici.fetch()` | WHATWG-compatible. |
 | `StreamHttpClient` | `undici.stream()` | Factory-callback pattern. |
@@ -322,6 +356,26 @@ import { DispatchHttpClient } from '@exhumer/signalr-client';
 const client = new DispatchHttpClient();
 const res = await client.get('https://example.com/api/data');
 ```
+
+Every client constructor accepts `HttpClientOptions`, including a dispatcher,
+default timeout, headers, and a buffered-response limit:
+
+```ts
+const client = new DispatchHttpClient({
+  maximumResponseBodySize: 8 * 1024 * 1024,
+});
+
+await client.post(url, {
+  body: new Uint8Array([0x00, 0xff]),
+  headers: { 'Content-Type': 'application/octet-stream' },
+});
+```
+
+For streaming responses, `DispatchHttpClient` pauses its undici dispatcher
+when the consumer applies backpressure and resumes it after the stream drains.
+Local benchmarks can be run with `npm run bench:transport`; results depend on
+the runtime and workload. The HTTP client affects WebSocket negotiation and
+startup only—steady-state WebSocket frames bypass it.
 
 ---
 
@@ -447,13 +501,13 @@ npm run bench:protocol
 npm run bench:transport
 ```
 
-The build uses [tsup](https://tsup.egoist.dev/) and produces:
+The build uses [tsdown](https://tsdown.dev/) and produces:
 
 | File | Format | Purpose |
 |---|---|---|
-| `dist/index.js` | ESM | `import` condition |
+| `dist/index.mjs` | ESM | `import` condition |
 | `dist/index.cjs` | CJS | `require` condition |
-| `dist/index.d.ts` | Types | ESM consumers |
+| `dist/index.d.mts` | Types | ESM consumers |
 | `dist/index.d.cts` | Types | CJS consumers |
 
 Source maps are emitted for all four files.

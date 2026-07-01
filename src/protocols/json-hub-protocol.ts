@@ -163,9 +163,9 @@ export class JsonHubProtocol implements IHubProtocol {
       type:      MessageType.Invocation,
       target:    raw.target,
       arguments: raw.arguments as unknown[],
-      ...(raw.invocationId != null && { invocationId: toInvocationId(String(raw.invocationId)) }),
-      ...(Array.isArray(raw.streamIds)  && { streamIds: raw.streamIds as string[] }),
-      ...(raw.headers      != null      && { headers:   raw.headers as Record<string, string> }),
+      ...(raw.invocationId != null && { invocationId: parseInvocationId(raw.invocationId) }),
+      ...(raw.streamIds    != null && { streamIds: parseStreamIds(raw.streamIds) }),
+      ...(raw.headers      != null && { headers:   parseHeaders(raw.headers) }),
     };
   }
 
@@ -175,9 +175,9 @@ export class JsonHubProtocol implements IHubProtocol {
     }
     return {
       type:         MessageType.StreamItem,
-      invocationId: toInvocationId(String(raw.invocationId)),
+      invocationId: parseInvocationId(raw.invocationId),
       item:         raw.item,
-      ...(raw.headers != null && { headers: raw.headers as Record<string, string> }),
+      ...(raw.headers != null && { headers: parseHeaders(raw.headers) }),
     };
   }
 
@@ -185,15 +185,16 @@ export class JsonHubProtocol implements IHubProtocol {
     if (raw.invocationId == null) {
       throw new Error("Invalid Completion message: 'invocationId' is required.");
     }
-    if (raw.error != null && raw.result != null) {
+    const hasResult = Object.prototype.hasOwnProperty.call(raw, 'result');
+    if (raw.error != null && hasResult) {
       throw new Error("Invalid Completion message: 'error' and 'result' are mutually exclusive.");
     }
     return {
       type:         MessageType.Completion,
-      invocationId: toInvocationId(String(raw.invocationId)),
+      invocationId: parseInvocationId(raw.invocationId),
       ...(raw.error  != null && { error:  String(raw.error)  }),
-      ...(raw.result != null && { result: raw.result         }),
-      ...(raw.headers != null && { headers: raw.headers as Record<string, string> }),
+      ...(hasResult          && { result: raw.result         }),
+      ...(raw.headers != null && { headers: parseHeaders(raw.headers) }),
     };
   }
 
@@ -209,11 +210,11 @@ export class JsonHubProtocol implements IHubProtocol {
     }
     return {
       type:         MessageType.StreamInvocation,
-      invocationId: toInvocationId(String(raw.invocationId)),
+      invocationId: parseInvocationId(raw.invocationId),
       target:       raw.target,
       arguments:    raw.arguments as unknown[],
-      ...(Array.isArray(raw.streamIds) && { streamIds: raw.streamIds as string[] }),
-      ...(raw.headers != null          && { headers:   raw.headers as Record<string, string> }),
+      ...(raw.streamIds != null && { streamIds: parseStreamIds(raw.streamIds) }),
+      ...(raw.headers   != null && { headers:   parseHeaders(raw.headers) }),
     };
   }
 
@@ -223,8 +224,8 @@ export class JsonHubProtocol implements IHubProtocol {
     }
     return {
       type:         MessageType.CancelInvocation,
-      invocationId: toInvocationId(String(raw.invocationId)),
-      ...(raw.headers != null && { headers: raw.headers as Record<string, string> }),
+      invocationId: parseInvocationId(raw.invocationId),
+      ...(raw.headers != null && { headers: parseHeaders(raw.headers) }),
     };
   }
 
@@ -233,11 +234,14 @@ export class JsonHubProtocol implements IHubProtocol {
   }
 
   #coerceClose(raw: RawMessage): CloseMessage {
+    if (raw.allowReconnect != null && typeof raw.allowReconnect !== 'boolean') {
+      throw new Error("Invalid Close message: 'allowReconnect' must be a boolean.");
+    }
     return {
       type:            MessageType.Close,
       ...(raw.error         != null && { error:          String(raw.error)         }),
-      ...(raw.allowReconnect != null && { allowReconnect: Boolean(raw.allowReconnect) }),
-      ...(raw.headers        != null && { headers:        raw.headers as Record<string, string> }),
+      ...(raw.allowReconnect != null && { allowReconnect: raw.allowReconnect }),
+      ...(raw.headers        != null && { headers:        parseHeaders(raw.headers) }),
     };
   }
 
@@ -313,4 +317,24 @@ export class JsonHubProtocol implements IHubProtocol {
   static ping(): PingMessage {
     return { type: MessageType.Ping };
   }
+}
+
+function parseInvocationId(value: unknown): InvocationId {
+  if (typeof value !== 'string') throw new Error("Invalid message: 'invocationId' must be a string.");
+  return toInvocationId(value);
+}
+
+function parseStreamIds(value: unknown): string[] {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === 'string')) {
+    throw new Error("Invalid message: 'streamIds' must be an array of strings.");
+  }
+  return value;
+}
+
+function parseHeaders(value: unknown): Record<string, string> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) ||
+      !Object.values(value).every((entry) => typeof entry === 'string')) {
+    throw new Error("Invalid message: 'headers' must be an object containing string values.");
+  }
+  return value as Record<string, string>;
 }

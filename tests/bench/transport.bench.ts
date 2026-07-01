@@ -9,10 +9,9 @@
  * │   This isolates the overhead of each HTTP primitive without any         │
  * │   SignalR protocol overhead.                                            │
  * ├─────────────────────────────────────────────────────────────────────────┤
- * │ SECTION 2 - WebSocket transport throughput                              │
- * │   A single long-lived WebSocket connection is established once in       │
- * │   beforeAll, then each iteration sends one JSON Ping and waits for the  │
- * │   echo. Tests all five HTTP clients for the negotiate step.             │
+ * │ SECTION 2 - WebSocket startup                                            │
+ * │   Each iteration negotiates with the selected HTTP client, upgrades to  │
+ * │   WebSocket, completes the SignalR handshake, and closes cleanly.        │
  * ├─────────────────────────────────────────────────────────────────────────┤
  * │ SECTION 3 - SSE transport: first-message latency                        │
  * │   Time to connect via SSE and receive the first message push.           │
@@ -35,7 +34,6 @@ import {
   DispatchHttpClient,
 } from '../../src/http-client.js';
 import { startBenchServer } from '../helpers/bench-server.js';
-import { JsonHubProtocol }    from '../../src/protocols/json-hub-protocol.js';
 import { MsgpackHubProtocol } from '../../src/protocols/msgpack-hub-protocol.js';
 import { MessageType, RECORD_SEPARATOR, TransferFormat } from '../../src/constants.js';
 import { NullLogger } from '../../src/logger.js';
@@ -48,8 +46,6 @@ import type { IHttpClient }   from '../../src/interfaces.js';
 let srv: BenchServer;
 
 const log  = NullLogger.instance;
-const json = new JsonHubProtocol();
-
 // HTTP client instances (one per variant, reused across benchmarks)
 let reqClient:      IHttpClient;
 let fetchClient:    IHttpClient;
@@ -111,101 +107,61 @@ describe('POST /negotiate - HTTP client comparison', () => {
   });
 });
 
-// ─── SECTION 2: WebSocket message round-trip ─────────────────────────────────
+// ─── SECTION 2: WebSocket connection startup ─────────────────────────────────
 //
-// We pre-establish one WebSocket connection per HTTP-client variant in
-// beforeAll, then benchmark how fast each can do a Ping echo round-trip.
+// The HTTP client is only involved in WebSocket negotiation. Once upgraded,
+// every variant uses the same WebSocketTransport and therefore has identical
+// steady-state behavior. Each iteration measures the meaningful distinction:
+// negotiate, upgrade, SignalR handshake, and clean shutdown.
 
-describe('WebSocket echo round-trip - per HTTP client for negotiate', () => {
+describe('WebSocket startup - per HTTP client for negotiate', () => {
 
-  // Shared helper: connect WS transport and complete the SignalR handshake,
-  // returning { transport, send } ready for the benchmark loop.
-  async function openWsConnection(httpClient: IHttpClient): Promise<{
-    transport: WebSocketTransport;
-    send: (wire: string) => Promise<void>;
-  }> {
+  async function wsStartup(httpClient: IHttpClient): Promise<void> {
+    const negotiation = await httpClient.post(`${srv.hubUrl}/negotiate`, {
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: '',
+    });
+    const response = JSON.parse(negotiation.body) as {
+      connectionToken: string;
+    };
     const transport = new WebSocketTransport(null, log, {}, undefined);
-    const wsUrl = srv.hubUrl.replace('http://', 'ws://');
+    const wsUrl = `${srv.hubUrl.replace('http://', 'ws://')}?id=${encodeURIComponent(response.connectionToken)}`;
 
-    // Connect the WebSocket transport (performs WS upgrade)
-    await transport.connect(wsUrl, TransferFormat.Text);
-
-    // Complete the SignalR JSON handshake
-    await new Promise<void>((resolve, reject) => {
-      transport.onreceive = (data: string | Uint8Array) => {
-        const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
-        if (text.includes(RECORD_SEPARATOR)) {
-          transport.onreceive = null;
-          resolve();
-        }
-      };
-      transport.send(
-        JSON.stringify({ protocol: 'json', version: 1 }) + RECORD_SEPARATOR,
-      ).catch(reject);
-    });
-
-    const send = (wire: string) => transport.send(wire);
-    return { transport, send };
+    try {
+      await transport.connect(wsUrl, TransferFormat.Text);
+      await new Promise<void>((resolve, reject) => {
+        transport.onreceive = (data: string | Uint8Array) => {
+          const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
+          if (text.includes(RECORD_SEPARATOR)) resolve();
+        };
+        transport.send(
+          JSON.stringify({ protocol: 'json', version: 1 }) + RECORD_SEPARATOR,
+        ).catch(reject);
+      });
+    } finally {
+      transport.onreceive = null;
+      await transport.stop();
+    }
   }
 
-  let wsReq:      Awaited<ReturnType<typeof openWsConnection>>;
-  let wsFetch:    Awaited<ReturnType<typeof openWsConnection>>;
-  let wsStream:   Awaited<ReturnType<typeof openWsConnection>>;
-  let wsPipeline: Awaited<ReturnType<typeof openWsConnection>>;
-  let wsDispatch: Awaited<ReturnType<typeof openWsConnection>>;
-
-  beforeAll(async () => {
-    [wsReq, wsFetch, wsStream, wsPipeline, wsDispatch] = await Promise.all([
-      openWsConnection(reqClient),
-      openWsConnection(fetchClient),
-      openWsConnection(streamClient),
-      openWsConnection(pipelineClient),
-      openWsConnection(dispatchClient),
-    ]);
-  }, 15_000);
-
-  afterAll(async () => {
-    await Promise.allSettled([
-      wsReq.transport.stop(),
-      wsFetch.transport.stop(),
-      wsStream.transport.stop(),
-      wsPipeline.transport.stop(),
-      wsDispatch.transport.stop(),
-    ]);
+  bench('RequestHttpClient  - WS startup', async () => {
+    await wsStartup(reqClient);
   });
 
-  /**
-   * Ping round-trip: send a JSON Ping frame, await the echo.
-   */
-  function pingRoundtrip(conn: { send: (wire: string) => Promise<void>; transport: WebSocketTransport }): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      const pingWire = json.writeMessage({ type: MessageType.Ping }) as string;
-      conn.transport.onreceive = () => {
-        conn.transport.onreceive = null;
-        resolve();
-      };
-      conn.send(pingWire).catch(reject);
-    });
-  }
-
-  bench('RequestHttpClient  - WS Ping round-trip',  async () => {
-    await pingRoundtrip(wsReq);
+  bench('FetchHttpClient    - WS startup', async () => {
+    await wsStartup(fetchClient);
   });
 
-  bench('FetchHttpClient    - WS Ping round-trip',  async () => {
-    await pingRoundtrip(wsFetch);
+  bench('StreamHttpClient   - WS startup', async () => {
+    await wsStartup(streamClient);
   });
 
-  bench('StreamHttpClient   - WS Ping round-trip',  async () => {
-    await pingRoundtrip(wsStream);
+  bench('PipelineHttpClient - WS startup', async () => {
+    await wsStartup(pipelineClient);
   });
 
-  bench('PipelineHttpClient - WS Ping round-trip',  async () => {
-    await pingRoundtrip(wsPipeline);
-  });
-
-  bench('DispatchHttpClient - WS Ping round-trip',  async () => {
-    await pingRoundtrip(wsDispatch);
+  bench('DispatchHttpClient - WS startup', async () => {
+    await wsStartup(dispatchClient);
   });
 });
 

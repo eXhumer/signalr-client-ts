@@ -44,7 +44,7 @@ async function createTestServer(): Promise<TestServer> {
   const server = http.createServer((req, res) => {
     const url = req.url ?? '/';
 
-    if (url === '/echo') {
+    if (url === '/echo' || url === '/echo-bytes') {
       // Echoes method, body, and received headers back as JSON
       const chunks: Buffer[] = [];
       req.on('data', (c: Buffer) => chunks.push(c));
@@ -54,7 +54,12 @@ async function createTestServer(): Promise<TestServer> {
           'Content-Type': 'application/json',
           'X-Custom':     'yes',
         });
-        res.end(JSON.stringify({ method: req.method, body, headers: req.headers }));
+        res.end(JSON.stringify({
+          method: req.method,
+          body,
+          bodyBase64: Buffer.concat(chunks).toString('base64'),
+          headers: req.headers,
+        }));
       });
 
     } else if (url === '/status/204') {
@@ -133,6 +138,13 @@ function registerCommonTests(label: string, factory: (srv: TestServer) => IHttpC
       });
       const parsed = JSON.parse(res.body) as { body: string };
       expect(parsed.body).toBe('raw text');
+    });
+
+    it('POST preserves arbitrary binary request bytes', async () => {
+      const bytes = new Uint8Array([0x00, 0x80, 0xff]);
+      const res = await client.post(url('/echo-bytes'), { body: bytes });
+      const parsed = JSON.parse(res.body) as { bodyBase64: string };
+      expect(parsed.bodyBase64).toBe(Buffer.from(bytes).toString('base64'));
     });
 
     it('DELETE is supported', async () => {
@@ -300,6 +312,20 @@ describe('HttpClientOptions.headers (session-level defaults)', () => {
   });
 });
 
+describe('HttpClientOptions.maximumResponseBodySize', () => {
+  let srv: TestServer;
+  beforeAll(async () => { srv = await createTestServer(); });
+  afterAll(async () => { await srv.close(); });
+
+  it('rejects buffered responses above the configured limit', async () => {
+    const client = new RequestHttpClient({
+      maximumResponseBodySize: 8,
+      dispatcher: trackDispatcher(new Agent()),
+    });
+    await expect(client.get(`http://127.0.0.1:${srv.port}/echo`)).rejects.toThrow(/byte limit/i);
+  });
+});
+
 // ─── Shared dispatcher ────────────────────────────────────────────────────────
 
 describe('Shared Dispatcher (session-level connection pool)', () => {
@@ -451,5 +477,54 @@ describe('DispatchHttpClient.stream - else branch of !resolved (L763)', () => {
     expect(() => {
       capturedHandler!.onResponseStart!(fakeCtrl, 200, {});
     }).not.toThrow();
+  });
+});
+
+describe('DispatchHttpClient resource limits and backpressure', () => {
+  it('aborts a buffered response that exceeds the configured size', async () => {
+    let handler: Dispatcher.DispatchHandler | null = null;
+    const dispatcher = {
+      dispatch(_opts: Dispatcher.DispatchOptions, value: Dispatcher.DispatchHandler): boolean {
+        handler = value;
+        return true;
+      },
+    } as unknown as Dispatcher;
+    const client = new DispatchHttpClient({ dispatcher, maximumResponseBodySize: 4 });
+    const request = client.get('http://example.com/large');
+    const controller = {
+      abort(error: Error): void { handler!.onResponseError!(controller, error); },
+    } as unknown as Dispatcher.DispatchController;
+    handler!.onRequestStart!(controller, null);
+    handler!.onResponseStart!(controller, 200, {});
+    handler!.onResponseData!(controller, Buffer.alloc(5));
+
+    await expect(request).rejects.toThrow(/byte limit/i);
+  });
+
+  it('pauses and resumes dispatch when the response stream applies backpressure', async () => {
+    let handler: Dispatcher.DispatchHandler | null = null;
+    let paused = false;
+    let resumed = false;
+    const dispatcher = {
+      dispatch(_opts: Dispatcher.DispatchOptions, value: Dispatcher.DispatchHandler): boolean {
+        handler = value;
+        return true;
+      },
+    } as unknown as Dispatcher;
+    const client = new DispatchHttpClient({ dispatcher });
+    const stream = client.stream('GET', 'http://example.com/stream');
+    const controller = {
+      pause(): void { paused = true; },
+      resume(): void { resumed = true; },
+      abort(): void {},
+    } as unknown as Dispatcher.DispatchController;
+    handler!.onRequestStart!(controller, null);
+    handler!.onResponseStart!(controller, 200, {});
+    const result = await stream;
+    handler!.onResponseData!(controller, Buffer.alloc(128 * 1024));
+    expect(paused).toBe(true);
+    result.body.emit('drain');
+    expect(resumed).toBe(true);
+    result.abort();
   });
 });

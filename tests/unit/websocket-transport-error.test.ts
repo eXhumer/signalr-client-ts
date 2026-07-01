@@ -117,7 +117,12 @@ const { FakeWebSocket, setConnectError, setPostOpenError, setSendError } = vi.ho
       this.#listeners.set(type, arr);
     }
 
-    removeEventListener(_type: string, _cb: unknown): void { /* no-op */ }
+    removeEventListener(type: string, cb: unknown): void {
+      const listeners = this.#listeners.get(type);
+      if (!listeners) return;
+      const index = listeners.indexOf(cb as (e: unknown) => void);
+      if (index !== -1) listeners.splice(index, 1);
+    }
     close(_code?: number, _reason?: string): void          { /* no-op */ }
     send(_data: unknown): void {
       if (sendError !== null) throw sendError;

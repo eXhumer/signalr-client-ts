@@ -56,6 +56,7 @@
 import { describe, it, beforeAll, afterAll, expect, vi } from 'vitest';
 import * as http from 'node:http';
 import * as net  from 'node:net';
+import { Readable } from 'node:stream';
 
 import { LongPollingTransport } from '../../src/transports/long-polling-transport.js';
 import { TransferFormat }       from '../../src/constants.js';
@@ -69,7 +70,7 @@ interface StagedGetResponse {
   /** HTTP status code to return. */
   status: number;
   /** Response body (empty string = no body). */
-  body:   string;
+  body:   string | Buffer;
 }
 
 interface LpTestServer {
@@ -503,12 +504,13 @@ describe('LongPollingTransport', () => {
 
   // ── 14. connect() accepts TransferFormat.Binary (parameter is unused) ─────
 
-  it('connect() accepts TransferFormat.Binary without throwing', async () => {
-    // LongPollingTransport names the parameter _transferFormat (intentionally
-    // unused) - it should not throw for Binary just as it does not for Text.
+  it('delivers binary poll responses without UTF-8 conversion', async () => {
     const { transport } = makeTransport();
 
-    srv.queueGet({ status: 200, body: '' }); // initial validation
+    const receivedP = new Promise<string | Uint8Array>((resolve) => {
+      transport.onreceive = resolve;
+    });
+    srv.queueGet({ status: 200, body: Buffer.from([0x00, 0x80, 0xff]) });
     srv.queueGet({ status: 204, body: '' }); // graceful shutdown
 
     const closedP = new Promise<void>((r) => { transport.onclose = (): void => r(); });
@@ -517,6 +519,7 @@ describe('LongPollingTransport', () => {
       transport.connect(srv.url, TransferFormat.Binary),
     ).resolves.toBeUndefined();
 
+    expect(Array.from(await receivedP as Uint8Array)).toEqual([0x00, 0x80, 0xff]);
     await closedP;
   });
 });
@@ -529,12 +532,22 @@ function makeMockClient(overrides: {
   delete?: (url: string, opts?: unknown) => Promise<HttpResponse>;
 }): IHttpClient {
   const ok: HttpResponse = { status: 200, headers: {}, body: '' };
+  const get = overrides.get ?? (() => Promise.resolve(ok));
   return {
-    get:     overrides.get    ?? (() => Promise.resolve(ok)),
+    get,
     post:    overrides.post   ?? (() => Promise.resolve(ok)),
     delete:  overrides.delete ?? (() => Promise.resolve(ok)),
     request: () => Promise.resolve(ok),
-    stream:  () => Promise.reject(new Error('not implemented')),
+    stream:  async (_method: string, url: string, opts?: unknown) => {
+      const response = await get(url, opts);
+      const body = Readable.from([Buffer.from(response.body)]);
+      return {
+        statusCode: response.status,
+        headers: response.headers,
+        body,
+        abort: () => body.destroy(),
+      };
+    },
   } as unknown as IHttpClient;
 }
 

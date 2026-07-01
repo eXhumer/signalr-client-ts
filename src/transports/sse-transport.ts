@@ -108,8 +108,7 @@ export class ServerSentEventsTransport implements ITransport {
       if (token) headers['Authorization'] = `Bearer ${token}`;
     }
 
-    const body   = typeof data === 'string' ? data : Buffer.from(data).toString('binary');
-    const result = await this.#httpClient.post(this.#url, { headers, body });
+    const result = await this.#httpClient.post(this.#url, { headers, body: data });
 
     if (result.status < 200 || result.status >= 300) {
       throw new Error(`SSE send failed with status ${result.status}.`);
