@@ -36,7 +36,9 @@
     // EventEmitter as a global without importing it - bugs in their own
     // typings that we cannot fix.  skipLibCheck suppresses those errors
     // while still fully type-checking our source files.
-    "skipLibCheck": true
+    "skipLibCheck": true,
+
+    "types": ["node"]
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]

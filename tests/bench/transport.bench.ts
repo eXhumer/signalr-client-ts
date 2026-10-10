@@ -24,7 +24,7 @@
  *   npx vitest bench tests/bench/transport.bench.ts
  */
 
-import { bench, describe, beforeAll, afterAll } from 'vitest';
+import { test, describe, beforeAll, afterAll } from 'vitest';
 
 import {
   RequestHttpClient,
@@ -71,39 +71,21 @@ afterAll(async () => {
 
 describe('POST /negotiate - HTTP client comparison', () => {
 
-  bench('RequestHttpClient  (undici.request)', async () => {
-    await reqClient.post(`${srv.hubUrl}/negotiate`, {
+  function negotiate(httpClient: IHttpClient) {
+    return httpClient.post(`${srv.hubUrl}/negotiate`, {
       headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
       body:    '',
     });
-  });
+  }
 
-  bench('FetchHttpClient    (undici.fetch)', async () => {
-    await fetchClient.post(`${srv.hubUrl}/negotiate`, {
-      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-      body:    '',
-    });
-  });
-
-  bench('StreamHttpClient   (undici.stream)', async () => {
-    await streamClient.post(`${srv.hubUrl}/negotiate`, {
-      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-      body:    '',
-    });
-  });
-
-  bench('PipelineHttpClient (undici.pipeline)', async () => {
-    await pipelineClient.post(`${srv.hubUrl}/negotiate`, {
-      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-      body:    '',
-    });
-  });
-
-  bench('DispatchHttpClient (Dispatcher#dispatch)', async () => {
-    await dispatchClient.post(`${srv.hubUrl}/negotiate`, {
-      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-      body:    '',
-    });
+  test('compare', async ({ bench }) => {
+    await bench.compare(
+      bench('RequestHttpClient  (undici.request)', () => negotiate(reqClient)),
+      bench('FetchHttpClient    (undici.fetch)', () => negotiate(fetchClient)),
+      bench('StreamHttpClient   (undici.stream)', () => negotiate(streamClient)),
+      bench('PipelineHttpClient (undici.pipeline)', () => negotiate(pipelineClient)),
+      bench('DispatchHttpClient (Dispatcher#dispatch)', () => negotiate(dispatchClient)),
+    );
   });
 });
 
@@ -144,24 +126,14 @@ describe('WebSocket startup - per HTTP client for negotiate', () => {
     }
   }
 
-  bench('RequestHttpClient  - WS startup', async () => {
-    await wsStartup(reqClient);
-  });
-
-  bench('FetchHttpClient    - WS startup', async () => {
-    await wsStartup(fetchClient);
-  });
-
-  bench('StreamHttpClient   - WS startup', async () => {
-    await wsStartup(streamClient);
-  });
-
-  bench('PipelineHttpClient - WS startup', async () => {
-    await wsStartup(pipelineClient);
-  });
-
-  bench('DispatchHttpClient - WS startup', async () => {
-    await wsStartup(dispatchClient);
+  test('compare', async ({ bench }) => {
+    await bench.compare(
+      bench('RequestHttpClient  - WS startup', () => wsStartup(reqClient)),
+      bench('FetchHttpClient    - WS startup', () => wsStartup(fetchClient)),
+      bench('StreamHttpClient   - WS startup', () => wsStartup(streamClient)),
+      bench('PipelineHttpClient - WS startup', () => wsStartup(pipelineClient)),
+      bench('DispatchHttpClient - WS startup', () => wsStartup(dispatchClient)),
+    );
   });
 });
 
@@ -195,24 +167,14 @@ describe('SSE connect-to-first-message latency - per HTTP client', () => {
     });
   }
 
-  bench('RequestHttpClient  - SSE first-message', async () => {
-    await sseLatency(reqClient);
-  });
-
-  bench('FetchHttpClient    - SSE first-message', async () => {
-    await sseLatency(fetchClient);
-  });
-
-  bench('StreamHttpClient   - SSE first-message', async () => {
-    await sseLatency(streamClient);
-  });
-
-  bench('PipelineHttpClient - SSE first-message', async () => {
-    await sseLatency(pipelineClient);
-  });
-
-  bench('DispatchHttpClient - SSE first-message', async () => {
-    await sseLatency(dispatchClient);
+  test('compare', async ({ bench }) => {
+    await bench.compare(
+      bench('RequestHttpClient  - SSE first-message', () => sseLatency(reqClient)),
+      bench('FetchHttpClient    - SSE first-message', () => sseLatency(fetchClient)),
+      bench('StreamHttpClient   - SSE first-message', () => sseLatency(streamClient)),
+      bench('PipelineHttpClient - SSE first-message', () => sseLatency(pipelineClient)),
+      bench('DispatchHttpClient - SSE first-message', () => sseLatency(dispatchClient)),
+    );
   });
 });
 
@@ -247,24 +209,14 @@ describe('Long-polling round-trip - per HTTP client', () => {
     await httpClient.delete(baseUrl);
   }
 
-  bench('RequestHttpClient  - LP round-trip', async () => {
-    await lpRoundtrip(reqClient);
-  });
-
-  bench('FetchHttpClient    - LP round-trip', async () => {
-    await lpRoundtrip(fetchClient);
-  });
-
-  bench('StreamHttpClient   - LP round-trip', async () => {
-    await lpRoundtrip(streamClient);
-  });
-
-  bench('PipelineHttpClient - LP round-trip', async () => {
-    await lpRoundtrip(pipelineClient);
-  });
-
-  bench('DispatchHttpClient - LP round-trip', async () => {
-    await lpRoundtrip(dispatchClient);
+  test('compare', async ({ bench }) => {
+    await bench.compare(
+      bench('RequestHttpClient  - LP round-trip', () => lpRoundtrip(reqClient)),
+      bench('FetchHttpClient    - LP round-trip', () => lpRoundtrip(fetchClient)),
+      bench('StreamHttpClient   - LP round-trip', () => lpRoundtrip(streamClient)),
+      bench('PipelineHttpClient - LP round-trip', () => lpRoundtrip(pipelineClient)),
+      bench('DispatchHttpClient - LP round-trip', () => lpRoundtrip(dispatchClient)),
+    );
   });
 });
 
@@ -324,11 +276,10 @@ describe('WS echo - JSON vs MessagePack wire payload', () => {
     });
   }
 
-  bench('JSON   Ping wire (WS echo)', async () => {
-    await echoRoundtrip(jsonPingWire);
-  });
-
-  bench('MP     Ping wire (WS echo)', async () => {
-    await echoRoundtrip(mpPingBytes);
+  test('compare', async ({ bench }) => {
+    await bench.compare(
+      bench('JSON   Ping wire (WS echo)', () => echoRoundtrip(jsonPingWire)),
+      bench('MP     Ping wire (WS echo)', () => echoRoundtrip(mpPingBytes)),
+    );
   });
 });

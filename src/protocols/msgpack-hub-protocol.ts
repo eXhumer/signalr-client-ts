@@ -26,7 +26,7 @@
  *   https://github.com/dotnet/aspnetcore/blob/main/src/SignalR/docs/specs/HubProtocol.md
  */
 
-import { encode, decode }          from '@msgpack/msgpack';
+import { Encoder, decode }         from '@msgpack/msgpack';
 import { MessageType, TransferFormat, RECORD_SEPARATOR } from '../constants.js';
 import type { IHubProtocol, ILogger } from '../interfaces.js';
 import {
@@ -72,16 +72,28 @@ type ResultKindValue = (typeof ResultKind)[keyof typeof ResultKind];
 
 // ─── VarInt framing (base-128 variable-length integer) ───────────────────────
 
-/** Write `n` as a base-128 VarInt (little-endian groups of 7 bits). */
-function writeVarInt(n: number): Uint8Array {
-  const bytes: number[] = [];
-  do {
-    let b = n & 0x7f;
+/** Number of bytes needed to write `n` as a base-128 VarInt. */
+function varIntLength(n: number): number {
+  let len = 1;
+  while (n >= 0x80) {
     n >>>= 7;
-    if (n > 0) b |= 0x80;
-    bytes.push(b);
-  } while (n > 0);
-  return new Uint8Array(bytes);
+    len++;
+  }
+  return len;
+}
+
+/**
+ * Write `n` as a base-128 VarInt (little-endian groups of 7 bits) into
+ * `out`, returning the offset just past the last byte written.
+ */
+function writeVarInt(n: number, out: Uint8Array): number {
+  let i = 0;
+  while (n >= 0x80) {
+    out[i++] = (n & 0x7f) | 0x80;
+    n >>>= 7;
+  }
+  out[i++] = n;
+  return i;
 }
 
 /** Read a VarInt from `data` starting at `offset`.  Returns value + bytes consumed. */
@@ -111,14 +123,20 @@ function readVarInt(data: Uint8Array, offset: number): { value: number; bytesRea
 
 // ─── Frame helper: encode a MessagePack array + prepend VarInt length ─────────
 
+/**
+ * One encoder reused for every frame.  `encode()` from @msgpack/msgpack builds
+ * a new Encoder (and a fresh 2 KB buffer) per call, which dominates the cost of
+ * encoding small hub messages.  Encoding is synchronous, so sharing is safe.
+ */
+const encoder = new Encoder();
+
 function pack(arr: unknown[]): ArrayBuffer {
-  const payload   = encode(arr);
-  const lenPrefix = writeVarInt(payload.length);
-  const result    = new Uint8Array(lenPrefix.length + payload.length);
-  result.set(lenPrefix, 0);
-  result.set(payload, lenPrefix.length);
-  // Return a standalone ArrayBuffer (not a shared typed-array view).
-  return result.buffer.slice(0, result.byteLength);
+  // encodeSharedRef returns a view into the encoder's internal buffer, valid
+  // only until the next encode - it is copied into the frame immediately.
+  const payload = encoder.encodeSharedRef(arr);
+  const frame   = new Uint8Array(varIntLength(payload.length) + payload.length);
+  frame.set(payload, writeVarInt(payload.length, frame));
+  return frame.buffer;
 }
 
 // ─── Protocol class ───────────────────────────────────────────────────────────

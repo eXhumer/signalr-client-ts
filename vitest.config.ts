@@ -57,19 +57,13 @@ export default defineConfig({
         lines: 100,
       },
     },
-  },
 
-  benchmark: {
-    /**
-     * Glob that picks up every benchmark file.
-     * Run with: npx vitest bench
-     */
-    include: ['tests/bench/**/*.bench.ts'],
-
-    /**
-     * Timeout per benchmark group (ms).  Network-round-trip benches
-     * iterate hundreds of times against a local server, so give them room.
-     */
-    hookTimeout: 60_000,
+    benchmark: {
+      /**
+       * Glob that picks up every benchmark file.
+       * Run with: npx vitest bench
+       */
+      include: ['tests/bench/**/*.bench.ts'],
+    },
   },
 });
