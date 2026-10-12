@@ -11,7 +11,7 @@ import { HubConnection }        from '../../src/hub-connection.js';
 import { LogLevel, HubConnectionState } from '../../src/constants.js';
 import type { IRetryPolicy, RetryContext } from '../../src/interfaces.js';
 import { Agent } from 'undici';
-import { MsgpackHubProtocol } from '../../src/protocols/msgpack-hub-protocol.js';
+import { JsonHubProtocol } from '../../src/protocols/json-hub-protocol.js';
 import {
   RequestHttpClient,
   FetchHttpClient,
@@ -308,9 +308,9 @@ describe('HubConnectionBuilder.withHttpClient()', () => {
 });
 
 describe('HubConnectionBuilder.withHubProtocol()', () => {
-  it('is chainable and accepts MessagePack', () => {
+  it('is chainable and accepts a protocol instance', () => {
     const builder = new HubConnectionBuilder().withUrl('http://localhost/hub');
-    expect(builder.withHubProtocol(new MsgpackHubProtocol())).toBe(builder);
+    expect(builder.withHubProtocol(new JsonHubProtocol())).toBe(builder);
     expect(builder.build()).toBeInstanceOf(HubConnection);
   });
 });

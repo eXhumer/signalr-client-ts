@@ -213,7 +213,7 @@ export class HubConnectionBuilder {
     return this;
   }
 
-  /** Select the hub wire protocol (for example, MessagePack). */
+  /** Select the hub wire protocol (for example, a custom `IHubProtocol`). */
   withHubProtocol(protocol: IHubProtocol): this {
     this.#protocol = protocol;
     return this;

@@ -1,15 +1,15 @@
 /**
  * tests/bench/protocol.bench.ts
  *
- * Micro-benchmark: JSON vs MessagePack hub protocol
+ * Micro-benchmark: JSON hub protocol
  *
  * Measures:
  *   • writeMessage()  - encode a HubMessage to its wire representation
  *   • parseMessages() - decode a pre-encoded wire payload back to HubMessage[]
  *
  * For every message type (Ping, Close, Invocation, StreamItem, Completion,
- * StreamInvocation, CancelInvocation) we run both directions so you can see
- * which protocol wins on encode, which wins on decode, and by how much.
+ * StreamInvocation, CancelInvocation) we compare encode, decode and the full
+ * round-trip side by side.
  *
  * Every bench function returns its result so the engine cannot eliminate
  * the work as dead code.
@@ -21,7 +21,6 @@
 import { test } from 'vitest';
 
 import { JsonHubProtocol }    from '../../src/protocols/json-hub-protocol.js';
-import { MsgpackHubProtocol } from '../../src/protocols/msgpack-hub-protocol.js';
 import { MessageType }        from '../../src/constants.js';
 import { NullLogger }         from '../../src/logger.js';
 import { toInvocationId }     from '../../src/messages.js';
@@ -29,7 +28,6 @@ import type { HubMessage }    from '../../src/messages.js';
 
 const log  = NullLogger.instance;
 const json = new JsonHubProtocol();
-const mp   = new MsgpackHubProtocol();
 
 // ─── Fixture messages ─────────────────────────────────────────────────────────
 
@@ -40,11 +38,10 @@ interface Fixture {
   message: HubMessage;
   /** Pre-encoded wire payloads, used by the decode benches. */
   json:    string;
-  mp:      ArrayBuffer;
 }
 
 function fixture(label: string, message: HubMessage): Fixture {
-  return { label, message, json: json.writeMessage(message), mp: mp.writeMessage(message) };
+  return { label, message, json: json.writeMessage(message) as string };
 }
 
 const PING           = fixture('Ping', { type: MessageType.Ping });
@@ -63,39 +60,21 @@ const CANCEL         = fixture('CancelInvocation', JsonHubProtocol.cancelInvocat
 const ALL = [PING, CLOSE, INV, INV_BIG, STREAM_ITEM, COMPLETION, COMPLETION_ERR, STREAM_INV, CANCEL];
 
 // ─── Payload size report ─────────────────────────────────────────────────────
-// Not a benchmark: prints the encoded size of each message in both protocols.
+// Not a benchmark: prints the encoded size of each message.
 
-test('Payload sizes (bytes) - JSON vs MessagePack', () => {
+test('Payload sizes (bytes)', () => {
   const encoder = new TextEncoder();
   console.table(Object.fromEntries(ALL.map((f) => [f.label, {
-    JSON:    encoder.encode(f.json).byteLength,
-    MsgPack: f.mp.byteLength,
+    JSON: encoder.encode(f.json).byteLength,
   }])));
 });
 
-// ─── WRITE (encode) benchmarks ────────────────────────────────────────────────
+// ─── Encode vs decode vs round-trip ───────────────────────────────────────────
 
-test.for(ALL)('writeMessage - $label', async (f, { bench }) => {
+test.for(ALL)('JSON protocol - $label', async (f, { bench }) => {
   await bench.compare(
-    bench('JSON',    () => json.writeMessage(f.message)),
-    bench('MsgPack', () =>   mp.writeMessage(f.message)),
-  );
-});
-
-// ─── PARSE (decode) benchmarks ────────────────────────────────────────────────
-
-test.for(ALL)('parseMessages - $label', async (f, { bench }) => {
-  await bench.compare(
-    bench('JSON',    () => json.parseMessages(f.json, log)),
-    bench('MsgPack', () =>   mp.parseMessages(f.mp,   log)),
-  );
-});
-
-// ─── Full round-trip (write + parse) ─────────────────────────────────────────
-
-test.for([PING, INV_BIG, COMPLETION])('round-trip (write+parse) - $label', async (f, { bench }) => {
-  await bench.compare(
-    bench('JSON',    () => json.parseMessages(json.writeMessage(f.message), log)),
-    bench('MsgPack', () =>   mp.parseMessages(mp.writeMessage(f.message),   log)),
+    bench('writeMessage', () => json.writeMessage(f.message)),
+    bench('parseMessages', () => json.parseMessages(f.json, log)),
+    bench('round-trip',    () => json.parseMessages(json.writeMessage(f.message), log)),
   );
 });

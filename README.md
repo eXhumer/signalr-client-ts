@@ -151,15 +151,15 @@ builder.withHttpClient(new FetchHttpClient());
 
 ### `.withHubProtocol(protocol)`
 
-Select the hub wire protocol. JSON is used by default; MessagePack provides a
-compact binary representation and requires server-side MessagePack support.
+Select the hub wire protocol. JSON (`JsonHubProtocol`) is used by default.
+Any object implementing `IHubProtocol` can be supplied.
 
 ```ts
-import { HubConnectionBuilder, MsgpackHubProtocol } from '@exhumer/signalr-client';
+import { HubConnectionBuilder, JsonHubProtocol } from '@exhumer/signalr-client';
 
 const connection = new HubConnectionBuilder()
   .withUrl('https://example.com/hub')
-  .withHubProtocol(new MsgpackHubProtocol())
+  .withHubProtocol(new JsonHubProtocol())
   .build();
 ```
 
@@ -308,7 +308,7 @@ const connection = new HubConnectionBuilder()
 
 ## Protocols
 
-The library currently ships two hub protocol implementations.
+The library ships one hub protocol implementation.
 
 **JSON** (default):
 
@@ -317,22 +317,8 @@ import { JsonHubProtocol } from '@exhumer/signalr-client';
 ```
 
 `HubConnection` uses `JsonHubProtocol` when no protocol is configured.
-
-**MessagePack**:
-
-```ts
-import { HubConnectionBuilder, MsgpackHubProtocol } from '@exhumer/signalr-client';
-
-const connection = new HubConnectionBuilder()
-  .withUrl('https://example.com/hub')
-  .withHubProtocol(new MsgpackHubProtocol())
-  .build();
-```
-
-The server must have the ASP.NET Core SignalR MessagePack protocol enabled.
-`MsgpackHubProtocol` depends on `@msgpack/msgpack`, which is a regular
-dependency of this package. Custom protocols can implement `IHubProtocol` and
-be supplied through the same builder method.
+MessagePack is not included. Custom protocols, including binary ones, can
+implement `IHubProtocol` and be supplied through `.withHubProtocol()`.
 
 ---
 

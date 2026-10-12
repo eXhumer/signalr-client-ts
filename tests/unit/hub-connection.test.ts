@@ -27,8 +27,9 @@ import {
   PipelineHttpClient,
   DispatchHttpClient,
 } from '../../src/http-client.js';
-import { MsgpackHubProtocol } from '../../src/protocols/msgpack-hub-protocol.js';
-import type { IHttpClient, ISubscription } from '../../src/interfaces.js';
+import { JsonHubProtocol } from '../../src/protocols/json-hub-protocol.js';
+import { TransferFormat } from '../../src/constants.js';
+import type { IHttpClient, IHubProtocol, ISubscription } from '../../src/interfaces.js';
 import { closeTrackedDispatchers, trackDispatcher } from '../helpers/dispatcher-tracker.js';
 
 afterEach(closeTrackedDispatchers);
@@ -893,13 +894,26 @@ describe('HubConnection - selectable hub protocol', () => {
   beforeAll(async () => { srv = await startSignalRServer(); });
   afterAll(async () => { await srv.close(); });
 
-  it('uses MessagePack handshake metadata and binary message encoding', async () => {
+  it('sends binary frames for a custom binary protocol', async () => {
+    // Minimal binary protocol: JSON text wrapped in an ArrayBuffer.
+    const json = new JsonHubProtocol();
+    const binaryProtocol: IHubProtocol = {
+      name:           json.name,
+      version:        json.version,
+      transferFormat: TransferFormat.Binary,
+      parseMessages:  (input, logger) => json.parseMessages(
+        typeof input === 'string' ? input : new TextDecoder().decode(input), logger),
+      writeMessage:   (message) => {
+        const bytes = new TextEncoder().encode(json.writeMessage(message) as string);
+        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      },
+    };
     const conn = new HubConnectionBuilder()
       .withUrl(srv.url, {
         skipNegotiation: true,
         transport: HttpTransportType.WebSockets,
       })
-      .withHubProtocol(new MsgpackHubProtocol())
+      .withHubProtocol(binaryProtocol)
       .build();
     const clientP = srv.nextClient();
     await conn.start();

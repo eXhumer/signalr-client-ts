@@ -31,7 +31,7 @@
 
     /* ── Library compatibility ───────────────────────────────────────────── */
     // Skip type-checking of .d.ts files inside node_modules.  Several
-    // dependencies (@msgpack/msgpack, @exhumer/undici-cookie-agent) have
+    // dependencies (@exhumer/undici-cookie-agent) have
     // declaration files that reference DOM globals (BufferSource) or use
     // EventEmitter as a global without importing it - bugs in their own
     // typings that we cannot fix.  skipLibCheck suppresses those errors

@@ -637,7 +637,7 @@ export class HubConnection {
 
     let messages;
     try {
-      /* istanbul ignore next -- MessagePack parsing is covered directly */
+      /* istanbul ignore next -- binary parsing is left to custom protocols */
       const input = this.#protocol.transferFormat === TransferFormat.Text
         ? Buffer.from(bytes).toString('utf8')
         : Uint8Array.from(bytes).buffer;

@@ -34,11 +34,6 @@ export type { UrlOptions }                        from './hub-connection-builder
 export { JsonHubProtocol, parseHandshakeResponse, HANDSHAKE_REQUEST } from './protocols/json-hub-protocol.js';
 export type { HandshakeResponse, HandshakeParseResult }               from './protocols/json-hub-protocol.js';
 
-export {
-  MsgpackHubProtocol,
-  HANDSHAKE_REQUEST as MSGPACK_HANDSHAKE_REQUEST,
-} from './protocols/msgpack-hub-protocol.js';
-
 // ── Messages (discriminated union + type guards) ───────────────────────────────
 export {
   toInvocationId,

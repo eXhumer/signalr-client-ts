@@ -34,7 +34,6 @@ import {
   DispatchHttpClient,
 } from '../../src/http-client.js';
 import { startBenchServer } from '../helpers/bench-server.js';
-import { MsgpackHubProtocol } from '../../src/protocols/msgpack-hub-protocol.js';
 import { MessageType, RECORD_SEPARATOR, TransferFormat } from '../../src/constants.js';
 import { NullLogger } from '../../src/logger.js';
 import { WebSocketTransport } from '../../src/transports/websocket-transport.js';
@@ -216,70 +215,6 @@ describe('Long-polling round-trip - per HTTP client', () => {
       bench('StreamHttpClient   - LP round-trip', () => lpRoundtrip(streamClient)),
       bench('PipelineHttpClient - LP round-trip', () => lpRoundtrip(pipelineClient)),
       bench('DispatchHttpClient - LP round-trip', () => lpRoundtrip(dispatchClient)),
-    );
-  });
-});
-
-// ─── SECTION 5: Protocol overhead on WebSocket (JSON vs MessagePack) ──────────
-//
-// Uses a single pre-established WebSocket connection; each iteration sends a
-// pre-encoded wire frame and awaits the echo.  Separates transport overhead
-// from protocol overhead by keeping the transport constant.
-
-// Pre-encode the MessagePack Ping wire frame at module load time
-const _mpPingBuf   = new MsgpackHubProtocol().writeMessage({ type: MessageType.Ping });
-const _mpPingBytes = new Uint8Array(_mpPingBuf);
-
-describe('WS echo - JSON vs MessagePack wire payload', () => {
-
-  let wsConn: {
-    transport: WebSocketTransport;
-    send: (data: string | Uint8Array) => Promise<void>;
-  };
-
-  const jsonPingWire = JSON.stringify({ type: MessageType.Ping }) + RECORD_SEPARATOR;
-  const mpPingBytes  = _mpPingBytes;
-
-  beforeAll(async () => {
-    const transport = new WebSocketTransport(null, log, {}, undefined);
-    const wsUrl = srv.hubUrl.replace('http://', 'ws://');
-    await transport.connect(wsUrl, TransferFormat.Text);
-
-    // Complete handshake
-    await new Promise<void>((resolve, reject) => {
-      transport.onreceive = (data: string | Uint8Array) => {
-        const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
-        if (text.includes(RECORD_SEPARATOR)) {
-          transport.onreceive = null;
-          resolve();
-        }
-      };
-      transport.send(
-        JSON.stringify({ protocol: 'json', version: 1 }) + RECORD_SEPARATOR,
-      ).catch(reject);
-    });
-
-    wsConn = { transport, send: (d) => transport.send(d) };
-  }, 15_000);
-
-  afterAll(async () => {
-    await wsConn.transport.stop().catch(() => {});
-  });
-
-  function echoRoundtrip(data: string | Uint8Array): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      wsConn.transport.onreceive = () => {
-        wsConn.transport.onreceive = null;
-        resolve();
-      };
-      wsConn.send(data).catch(reject);
-    });
-  }
-
-  test('compare', async ({ bench }) => {
-    await bench.compare(
-      bench('JSON   Ping wire (WS echo)', () => echoRoundtrip(jsonPingWire)),
-      bench('MP     Ping wire (WS echo)', () => echoRoundtrip(mpPingBytes)),
     );
   });
 });
