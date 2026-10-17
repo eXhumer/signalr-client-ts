@@ -63,20 +63,23 @@
     "aspnetcore",
     "realtime",
     "websocket",
-    "typescript"
+    "typescript",
+    "signalr-core",
+    "signalr-client",
+    "nodejs"
   ],
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^26.6.5",
-    "@vitest/coverage-istanbul": "^5.0.3",
-    "tsdown": "^0.23.0",
+    "@vitest/coverage-istanbul": "^5.0.5",
+    "tsdown": "^0.23.1",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.3"
+    "vitest": "^5.0.5"
   },
   "dependencies": {
     "@exhumer/undici-cookie-agent": "^2.0.1",
     "tough-cookie": "^6.0.2",
-    "undici": "^8.11.2"
+    "undici": "^8.12.2"
   },
   "allowScripts": {
     "fsevents@2.3.3": true
