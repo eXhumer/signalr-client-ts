@@ -1050,6 +1050,34 @@ describe('HubConnection - lifecycle and callback edge cases', () => {
     expect(conn.state).toBe(HubConnectionState.Disconnected);
   });
 
+  it('server timeout reconnects instead of closing when a reconnect policy is configured', async () => {
+    const conn = new HubConnectionBuilder()
+      .withUrl(srv.url, { serverTimeoutInMilliseconds: 80 })
+      .configureLogging(LogLevel.None)
+      .withAutomaticReconnect([0])
+      .build();
+
+    let reconnectingErr: Error | undefined;
+    let closed = 0;
+    conn.onreconnecting((err) => { reconnectingErr = err; });
+    conn.onclose(() => { closed++; });
+    const reconnectedP = new Promise<void>((resolve) => conn.onreconnected(() => resolve()));
+
+    const clientP = srv.nextClient();
+    await conn.start();
+    await clientP; // server connects but never sends a message
+    const secondClientP = srv.nextClient();
+
+    await reconnectedP;
+    await secondClientP;
+
+    expect(reconnectingErr?.message).toMatch(/Server timeout/);
+    expect(conn.state).toBe(HubConnectionState.Connected);
+    expect(closed).toBe(0);
+    await conn.stop();
+    expect(closed).toBe(1);
+  });
+
   // ── Completion with error field calls stream subscriber error() ──────────
   // Note: StreamItemMessage has no `error` field in the protocol schema -
   // the parser strips it. The hub-connection's stream-error path is exercised
@@ -1237,7 +1265,8 @@ describe('HubConnection - lifecycle and callback edge cases', () => {
       .withAutomaticReconnect(slowRetryPolicy)
       .build();
 
-    const closedP = new Promise<void>((resolve) => conn.onclose(() => resolve()));
+    let closed = 0;
+    const closedP = new Promise<void>((resolve) => conn.onclose(() => { closed++; resolve(); }));
 
     const clientP = srv.nextClient();
     await conn.start();
@@ -1257,9 +1286,11 @@ describe('HubConnection - lifecycle and callback edge cases', () => {
     // #stopping=true; after the sleep resolves, L719 fires and breaks the loop.
     await conn.stop();
 
-    // #doReconnect finishes and calls #completeClose → onclose fires.
+    // stop() closes the connection; the loop then exits without closing again.
     await closedP;
+    await new Promise<void>((r) => setTimeout(r, 250));
     expect(conn.state).toBe(HubConnectionState.Disconnected);
+    expect(closed).toBe(1);
   });
 });
 

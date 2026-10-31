@@ -93,7 +93,9 @@ builder.configureLogging({
 
 ### `.withAutomaticReconnect()`
 
-Enable automatic reconnection on unexpected disconnects.
+Enable automatic reconnection on unexpected disconnects: the transport
+dropping, the server going silent for `serverTimeoutInMilliseconds`, or a
+server `Close` message that allows reconnecting.
 
 ```ts
 // Default delays: 0 ms, 2 s, 10 s, 30 s - then give up

@@ -697,18 +697,7 @@ export class HubConnection {
           // permanent disconnect.  Null out onclose on the old transport to
           // prevent #onTransportClosed from firing a second reconnect loop.
           if (msg.allowReconnect && this.#reconnectPolicy && !this.#stopping) {
-            this.#clearTimers();
-            /* istanbul ignore next - #transport is always non-null here; null
-               is a defensive guard against theoretical concurrent nulling. */
-            if (this.#transport) this.#transport.onclose = null;
-            const t = this.#transport;
-            this.#transport = null;
-            this.#rejectAllPending(closeErr ?? new AbortError('Connection closed while reconnecting.'));
-            void t?.stop().catch(
-              /* istanbul ignore next -- shutdown after a server Close is best-effort */
-              () => {},
-            );
-            void this.#doReconnect(closeErr);
+            this.#abandonTransportAndReconnect(closeErr);
           } else {
             this.#stopWithError(closeErr);
           }
@@ -776,6 +765,25 @@ export class HubConnection {
     } else {
       this.#completeClose(err);
     }
+  }
+
+  /**
+   * Drop the current transport without firing its onclose (which would start a
+   * second reconnect loop) and reconnect.  Requires a reconnect policy.
+   */
+  #abandonTransportAndReconnect(err: Error | null): void {
+    this.#clearTimers();
+    const t = this.#transport;
+    /* istanbul ignore next - #transport is always non-null here; null
+       is a defensive guard against theoretical concurrent nulling. */
+    if (t) t.onclose = null;
+    this.#transport = null;
+    this.#rejectAllPending(err ?? new AbortError('Connection closed while reconnecting.'));
+    void t?.stop().catch(
+      /* istanbul ignore next -- shutdown of an abandoned transport is best-effort */
+      () => {},
+    );
+    void this.#doReconnect(err);
   }
 
   #stopWithError(err: Error | null): void {
@@ -849,6 +857,8 @@ export class HubConnection {
       }
     }
 
+    // stop() during a reconnect has already closed the connection.
+    if (this.#stopping) return;
     this.#completeClose(lastError ?? undefined);
   }
 
@@ -872,8 +882,16 @@ export class HubConnection {
   #resetServerTimeoutTimer(): void {
     clearTimeout(this.#serverTimeoutTimer!);
     this.#serverTimeoutTimer = setTimeout(() => {
-      this.#logger.log(LogLevel.Warning, 'Server timeout - closing connection.');
-      this.#stopWithError(new AbortError('Server timeout: no message received within the timeout period.'));
+      const err = new AbortError('Server timeout: no message received within the timeout period.');
+      // Like Microsoft's client, a silent server is a lost connection: with a
+      // reconnect policy it reconnects instead of closing for good.
+      if (this.#reconnectPolicy && !this.#stopping) {
+        this.#logger.log(LogLevel.Warning, 'Server timeout - reconnecting.');
+        this.#abandonTransportAndReconnect(err);
+      } else {
+        this.#logger.log(LogLevel.Warning, 'Server timeout - closing connection.');
+        this.#stopWithError(err);
+      }
     }, this.#serverTimeout);
   }
 
