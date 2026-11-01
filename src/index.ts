@@ -1,12 +1,12 @@
 /**
- * @signalr/client
+ * @exhumer/signalr-client
  *
  * ASP.NET Core SignalR client for Node.js.
  * HTTP and WebSocket layers are backed by undici.
  *
  * @example
  * ```ts
- * import { HubConnectionBuilder, LogLevel } from '@signalr/client';
+ * import { HubConnectionBuilder, LogLevel } from '@exhumer/signalr-client';
  *
  * const connection = new HubConnectionBuilder()
  *   .withUrl('https://example.com/chathub')
@@ -130,16 +130,13 @@ export {
 export type { RequestOptions, HttpClientOptions, HttpMethod } from './http-client.js';
 
 // ── Transports (exposed for advanced / custom use) ────────────────────────────
-export { WebSocketTransport }        from './transports/websocket-transport.js';
+export { WebSocketTransport, WebSocketReadyState } from './transports/websocket-transport.js';
 export { ServerSentEventsTransport } from './transports/sse-transport.js';
 export { LongPollingTransport }      from './transports/long-polling-transport.js';
 
-// ── Low-level hand-rolled WebSocket client (kept for direct use if needed) ────
-export { WebSocketClient, WebSocketReadyState } from './ws-client.js';
-
 // ── Cookie support ────────────────────────────────────────────────────────────
 //
-// Re-exported so consumers can use CookieJar, CookieAgent, and the low-level
+// Re-exported so consumers can use CookieJar, CookieAgent, createCookieAgent, and the low-level
 // `cookie` interceptor without a separate `npm install tough-cookie @exhumer/undici-cookie-agent`.
 //
 // Typical usage:
@@ -162,7 +159,7 @@ export { WebSocketClient, WebSocketReadyState } from './ws-client.js';
 //
 //   const jar   = new CookieJar();
 //   const agent = new ProxyAgent('http://proxy:8080');
-//   const agentWithCookies = agent.compose(cookie({ jar }));
+//   const agentWithCookies = agent.compose(cookie({ cookies: { jar } }));
 //
 //   const conn = new HubConnectionBuilder()
 //     .withUrl('https://example.com/hub')
@@ -170,4 +167,4 @@ export { WebSocketClient, WebSocketReadyState } from './ws-client.js';
 //     .build();
 //
 export { CookieJar }             from 'tough-cookie';
-export { CookieAgent, cookie }   from '@exhumer/undici-cookie-agent';
+export { CookieAgent, cookie, createCookieAgent } from '@exhumer/undici-cookie-agent';

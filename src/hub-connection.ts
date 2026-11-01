@@ -51,7 +51,7 @@ import type {
   Dispatcher,
   IHubProtocol,
 } from './interfaces.js';
-import type { HubMessage, InvocationId } from './messages.js';
+import type { CompletionMessage, HubMessage, InvocationId } from './messages.js';
 import { toInvocationId }    from './messages.js';
 
 const MAX_REDIRECTS = 100;
@@ -95,8 +95,12 @@ export interface HubConnectionOptions {
   readonly protocol?:                        IHubProtocol;
   /** Maximum accepted transport payload size. Defaults to 32 MiB. */
   readonly maximumReceiveMessageSize?:       number;
-  /** Internal: close a builder-created dispatcher when the connection ends. */
-  readonly ownsDispatcher?:                  boolean;
+  /**
+   * Internal: creates a dispatcher this connection owns. It is closed when the
+   * connection ends and created again by the next `start()`. Takes the place
+   * of `dispatcher`.
+   */
+  readonly dispatcherFactory?:               () => Dispatcher;
 }
 
 // ─── Internal pending-invocation tracking ────────────────────────────────────
@@ -150,9 +154,10 @@ export class HubConnection {
   readonly #reconnectPolicy:      IRetryPolicy | null;
 
   readonly #protocol:    IHubProtocol;
-  readonly #http:        IHttpClient;
-  readonly #dispatcher:  Dispatcher | undefined;
-  readonly #ownsDispatcher: boolean;
+  readonly #customHttp:  IHttpClient | null;
+  readonly #dispatcherFactory: (() => Dispatcher) | null;
+  #http:                 IHttpClient;
+  #dispatcher:           Dispatcher | undefined;
   readonly #maximumReceiveMessageSize: number;
 
   #transport:       ITransport | null         = null;
@@ -183,6 +188,14 @@ export class HubConnection {
   #handshakeRejecter: ((e: Error) => void) | null = null;
 
   #handshakeBuffer: Buffer = Buffer.alloc(0);
+  /**
+   * Payloads received after the handshake and before the connection is marked
+   * Connected. `null` outside that window.
+   */
+  #earlyPayloads: Uint8Array[] | null = null;
+  /** The start or reconnect in progress; aborting it makes it give up. */
+  #attempt: AbortController | null = null;
+  #stopPromise: Promise<void> | null = null;
   #dispatcherClosePromise: Promise<void> | null = null;
   #invocationSeq: number = 0;
 
@@ -199,16 +212,20 @@ export class HubConnection {
     this.#handshakeTimeout   = options.handshakeTimeoutInMilliseconds    ?? 15_000;
     this.#reconnectPolicy    = options.reconnectPolicy ?? null;
     this.#protocol           = options.protocol ?? new JsonHubProtocol();
-    this.#dispatcher         = options.dispatcher;
-    this.#ownsDispatcher     = options.ownsDispatcher ?? false;
+    this.#dispatcherFactory  = options.dispatcherFactory ?? null;
+    this.#dispatcher         = this.#dispatcherFactory?.() ?? options.dispatcher;
     this.#maximumReceiveMessageSize = options.maximumReceiveMessageSize ?? 32 * 1024 * 1024;
     // Use the caller-supplied client, or create a DispatchHttpClient that shares
     // the same dispatcher so negotiate + polls + WebSocket all use one pool.
-    this.#http               = options.httpClient
-      ?? new DispatchHttpClient({
-           headers:    this.#extraHeaders,
-           ...(options.dispatcher !== undefined && { dispatcher: options.dispatcher }),
-         });
+    this.#customHttp         = options.httpClient ?? null;
+    this.#http               = this.#customHttp ?? this.#createHttpClient();
+  }
+
+  #createHttpClient(): IHttpClient {
+    return new DispatchHttpClient({
+      headers: this.#extraHeaders,
+      ...(this.#dispatcher !== undefined && { dispatcher: this.#dispatcher }),
+    });
   }
 
   // ─── State ───────────────────────────────────────────────────────────────
@@ -226,30 +243,50 @@ export class HubConnection {
     }
     this.#state    = HubConnectionState.Connecting;
     this.#stopping = false;
+    this.#renewDispatcher();
     this.#logger.log(LogLevel.Debug, 'Starting HubConnection.');
 
+    const attempt = new AbortController();
+    this.#attempt = attempt;
     try {
-      await this.#startInternal();
+      await this.#startInternal(attempt.signal);
+      this.#attempt = null;
       this.#state = HubConnectionState.Connected;
       this.#logger.log(LogLevel.Information, 'HubConnection connected.');
+      this.#flushEarlyPayloads();
     } catch (err) {
-      this.#clearTimers();
-      this.#handshakeResolver = null;
-      this.#handshakeRejecter = null;
-      this.#handshakeBuffer = Buffer.alloc(0);
-      if (this.#transport) {
-        this.#transport.onclose = null;
-        await this.#transport.stop().catch(/* istanbul ignore next -- cleanup is best-effort */ () => {});
-        this.#transport = null;
+      this.#attempt = null;
+      await this.#abandonAttempt();
+      this.#connectionId    = null;
+      this.#connectionToken = null;
+      // stop() is still finishing; it sets the final state itself.
+      if (!this.#stopping) {
+        this.#state = HubConnectionState.Disconnected;
+        void this.#closeOwnedDispatcher();
       }
-      this.#state = HubConnectionState.Disconnected;
       this.#logger.log(LogLevel.Error, `Failed to start: ${(err as Error).message}`);
       throw err;
     }
   }
 
-  async stop(): Promise<void> {
-    if (this.#state === HubConnectionState.Disconnected) return;
+  /**
+   * Stop the connection. A start or reconnect in progress gives up, and a
+   * `start()` still pending rejects with an `AbortError`. `onclose` fires
+   * unless the connection never got as far as connecting. Calls made while one
+   * is already stopping share its result.
+   */
+  stop(): Promise<void> {
+    if (this.#state === HubConnectionState.Disconnected) return Promise.resolve();
+    if (this.#stopPromise) return this.#stopPromise;
+    const stopping: Promise<void> = this.#stopInternal().finally(() => {
+      this.#stopPromise = null;
+    });
+    this.#stopPromise = stopping;
+    return stopping;
+  }
+
+  async #stopInternal(): Promise<void> {
+    const neverConnected = this.#state === HubConnectionState.Connecting;
     this.#stopping = true;
     this.#state = HubConnectionState.Disconnecting;
     this.#logger.log(LogLevel.Debug, 'Stopping HubConnection.');
@@ -257,14 +294,12 @@ export class HubConnection {
 
     const stopErr = new AbortError('Connection stopped before the invocation completed.');
     this.#rejectAllPending(stopErr);
+    this.#attempt?.abort(new AbortError('The connection was stopped.'));
 
-    /* istanbul ignore else -- non-disconnected connections normally own a transport */
-    if (this.#transport) {
-      this.#transport.onclose = null;
-      try { await this.#transport.stop(); } catch { /* ignore */ }
-      this.#transport = null;
-    }
-    this.#completeClose();
+    try { await this.#detachTransport()?.stop(); } catch { /* ignore */ }
+
+    if (neverConnected) this.#state = HubConnectionState.Disconnected;
+    else this.#completeClose();
     await this.#closeOwnedDispatcher();
     this.#logger.log(LogLevel.Information, 'HubConnection stopped.');
   }
@@ -277,7 +312,7 @@ export class HubConnection {
    * @typeParam T  The expected return type.  Asserted at runtime - the server
    *               decides the actual value.
    */
-  invoke<T = void>(methodName: string, ...args: unknown[]): Promise<T> {
+  async invoke<T = void>(methodName: string, ...args: unknown[]): Promise<T> {
     this.#assertConnected('invoke');
     const id  = this.#nextId();
     const msg = this.#encode(JsonHubProtocol.invocation(id, methodName, args));
@@ -298,7 +333,7 @@ export class HubConnection {
    * Fire-and-forget hub method invocation.
    * The server does not send a completion message.
    */
-  send(methodName: string, ...args: unknown[]): Promise<void> {
+  async send(methodName: string, ...args: unknown[]): Promise<void> {
     this.#assertConnected('send');
     const msg = this.#encode(JsonHubProtocol.send(methodName, args));
     return this.#send(msg);
@@ -309,6 +344,8 @@ export class HubConnection {
   /**
    * Start a server-streaming invocation immediately.
    * The returned `ISubscription` implements `Symbol.dispose` for `using`.
+   * Failures, including calling this while not connected, go to the
+   * subscriber's `error` callback.
    *
    * @typeParam T  Type of each streamed item.
    *
@@ -321,7 +358,6 @@ export class HubConnection {
    * ```
    */
   stream<T = unknown>(methodName: string, ...args: unknown[]): IStreamResult<T> {
-    this.#assertConnected('stream');
     const id = this.#nextId();
     type Notification =
       | { kind: 'next'; value: T }
@@ -336,9 +372,14 @@ export class HubConnection {
         queued.push(notification);
         return;
       }
-      if (notification.kind === 'next') activeSubscriber.next?.(notification.value);
-      else if (notification.kind === 'error') activeSubscriber.error?.(notification.error);
-      else activeSubscriber.complete?.();
+      // A subscriber's bug must not stop message processing or a clean close.
+      try {
+        if (notification.kind === 'next') activeSubscriber.next?.(notification.value);
+        else if (notification.kind === 'error') activeSubscriber.error?.(notification.error);
+        else activeSubscriber.complete?.();
+      } catch (err) {
+        this.#logger.log(LogLevel.Error, `Subscriber of "${methodName}" threw: ${(err as Error).message}`);
+      }
     };
 
     this.#streamCbs.set(id, {
@@ -347,11 +388,16 @@ export class HubConnection {
       complete: ()      => deliver({ kind: 'complete' }),
     });
 
-    const msg = this.#encode(JsonHubProtocol.streamInvocation(id, methodName, args));
-    this.#send(msg).catch((error: Error) => {
+    const fail = (error: Error): void => {
       this.#streamCbs.delete(id);
       deliver({ kind: 'error', error });
-    });
+    };
+    try {
+      this.#assertConnected('stream');
+      this.#send(this.#encode(JsonHubProtocol.streamInvocation(id, methodName, args))).catch(fail);
+    } catch (error) {
+      fail(error as Error);
+    }
 
     return {
       subscribe: (subscriber: IStreamSubscriber<T>): ISubscription => {
@@ -412,19 +458,21 @@ export class HubConnection {
 
   // ─── Internal: start sequence ────────────────────────────────────────────
 
-  async #startInternal(): Promise<void> {
+  async #startInternal(signal: AbortSignal): Promise<void> {
     let url = this.#url;
+    // A token from a negotiate redirect belongs to that redirect, not to the
+    // next connection.
+    this.#_accessTokenFactory = null;
 
     if (this.#skipNegotiation) {
       if (this.#requestedTransport !== HttpTransportType.WebSockets) {
         throw new Error('skipNegotiation requires WebSockets as the only transport.');
       }
-      this.#transport = this.#createTransport(HttpTransportType.WebSockets);
-      await this.#connectTransport(url, this.#protocol.transferFormat);
+      await this.#connectTransport(this.#createTransport(HttpTransportType.WebSockets), url, signal);
     } else {
       let redirectCount = 0;
       for (;;) {
-        const neg = await this.#negotiate(url);
+        const neg = await abortable(this.#negotiate(url), signal);
 
         if (neg.url) {
           if (redirectCount++ >= MAX_REDIRECTS) throw new Error('Too many negotiate redirects.');
@@ -442,7 +490,7 @@ export class HubConnection {
         this.#connectionToken = neg.connectionToken ?? neg.connectionId ?? null;
 
         /* istanbul ignore next -- the protocol requires availableTransports */
-        await this.#selectTransport(url, neg.availableTransports ?? []);
+        await this.#selectTransport(url, neg.availableTransports ?? [], signal);
         break;
       }
     }
@@ -452,7 +500,8 @@ export class HubConnection {
     this.#transport!.onclose   = (err) => this.#onTransportClosed(err);
 
     // Protocol handshake
-    await this.#performHandshake();
+    await abortable(this.#performHandshake(), signal);
+    signal.throwIfAborted();
 
     // Keep-alive
     this.#resetPingTimer();
@@ -509,6 +558,7 @@ export class HubConnection {
   async #selectTransport(
     url:       string,
     available: readonly { transport: string; transferFormats: readonly string[] }[],
+    signal:    AbortSignal,
   ): Promise<void> {
     const ORDERED = [
       { flag: HttpTransportType.WebSockets,       name: 'WebSockets'       },
@@ -517,6 +567,8 @@ export class HubConnection {
     ] as const;
     /* istanbul ignore next -- both protocol formats are exercised at the protocol boundary */
     const formatName = this.#protocol.transferFormat === TransferFormat.Binary ? 'Binary' : 'Text';
+    const failures: string[] = [];
+    let lastError: Error | undefined;
 
     for (const pref of ORDERED) {
       if ((this.#requestedTransport & pref.flag) === 0) continue;
@@ -530,22 +582,40 @@ export class HubConnection {
       const tUrl      = appendParam(url, 'id', token);
 
       try {
-        await transport.connect(tUrl, this.#protocol.transferFormat);
-        this.#transport = transport;
+        await this.#connectTransport(transport, tUrl, signal);
         return;
       } catch (err) {
-        this.#logger.log(LogLevel.Warning, `${pref.name} failed: ${(err as Error).message}`);
+        if (signal.aborted) throw err;
+        lastError = err as Error;
+        failures.push(`${pref.name}: ${lastError.message}`);
+        this.#logger.log(LogLevel.Warning, `${pref.name} failed: ${lastError.message}`);
       }
     }
 
     throw new UnsupportedTransportError(
-      'Unable to connect with any of the available transports.',
-      null
+      ['Unable to connect with any of the available transports.', ...failures].join(' '),
+      null,
+      lastError && { cause: lastError },
     );
   }
 
-  async #connectTransport(url: string, format: TransferFormat): Promise<void> {
-    await this.#transport!.connect(url, format);
+  async #connectTransport(transport: ITransport, url: string, signal: AbortSignal): Promise<void> {
+    // Held from here on so that stop() reaches a transport still connecting.
+    this.#transport = transport;
+    const connecting = transport.connect(url, this.#protocol.transferFormat);
+    try {
+      await abortable(connecting, signal);
+    } catch (err) {
+      // A transport can still finish connecting after the attempt gave up.
+      if (signal.aborted) {
+        void connecting.then(() => transport.stop()).catch(
+          /* istanbul ignore next -- shutdown of an abandoned transport is best-effort */
+          () => {},
+        );
+      }
+      if (this.#transport === transport) this.#transport = null;
+      throw err;
+    }
   }
 
   #createTransport(type: number): ITransport {
@@ -555,9 +625,9 @@ export class HubConnection {
       case HttpTransportType.WebSockets:
         return new WebSocketTransport(factory, this.#logger, headers, this.#dispatcher);
       case HttpTransportType.ServerSentEvents:
-        return new ServerSentEventsTransport(this.#http, factory, this.#logger, headers);
+        return new ServerSentEventsTransport(this.#http, factory, this.#logger, headers, this.#maximumReceiveMessageSize);
       case HttpTransportType.LongPolling:
-        return new LongPollingTransport(this.#http, factory, this.#logger, headers);
+        return new LongPollingTransport(this.#http, factory, this.#logger, headers, this.#maximumReceiveMessageSize);
       /* istanbul ignore next */
       default:
         throw new UnsupportedTransportError(`Unknown transport type: ${type}`, type);
@@ -572,29 +642,42 @@ export class HubConnection {
       this.#handshakeRejecter = reject;
 
       const request = JSON.stringify({ protocol: this.#protocol.name, version: this.#protocol.version }) + '\x1e';
-      const fail = (error: unknown): void => {
-        clearTimeout(this.#handshakeTimer!);
-        this.#handshakeResolver = null;
-        this.#handshakeRejecter = null;
+      this.#transport!.send(request).catch((error: unknown) => {
         /* istanbul ignore next -- transport.send rejects with Error */
-        reject(error instanceof Error ? error : new Error(String(error)));
-      };
-      this.#transport!.send(request).catch(fail);
+        this.#failHandshake(error instanceof Error ? error : new Error(String(error)));
+      });
 
       this.#handshakeTimer = setTimeout(() => {
-        fail(new Error('Server timeout: no handshake response received.'));
+        this.#failHandshake(new Error('Server timeout: no handshake response received.'));
       }, this.#handshakeTimeout);
     });
+  }
+
+  #failHandshake(error: Error): void {
+    clearTimeout(this.#handshakeTimer!);
+    const reject = this.#handshakeRejecter;
+    this.#handshakeResolver = null;
+    this.#handshakeRejecter = null;
+    this.#handshakeBuffer   = Buffer.alloc(0);
+    reject?.(error);
   }
 
   // ─── Internal: incoming data ─────────────────────────────────────────────
 
   #processIncoming(data: string | Uint8Array): void {
-    this.#resetServerTimeoutTimer();
+    // The handshake has its own timeout, and the server timeout starts after it.
+    if (!this.#handshakeResolver) this.#resetServerTimeoutTimer();
     /* istanbul ignore next -- binary input is exercised through binary protocol tests */
     const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data);
     if (bytes.byteLength > this.#maximumReceiveMessageSize) {
-      this.#stopWithError(new Error(`Incoming message exceeds ${this.#maximumReceiveMessageSize} bytes.`));
+      const err = new Error(`Incoming message exceeds ${this.#maximumReceiveMessageSize} bytes.`);
+      if (this.#handshakeResolver) this.#failHandshake(err);
+      else this.#stopWithError(err);
+      return;
+    }
+
+    if (this.#earlyPayloads) {
+      this.#earlyPayloads.push(bytes);
       return;
     }
 
@@ -613,22 +696,28 @@ export class HubConnection {
         const r = this.#handshakeResolver;
         this.#handshakeResolver = null;
         this.#handshakeRejecter = null;
+        // Hub messages wait for the connection to be Connected: a Close among
+        // them must not race whoever is finishing the start or reconnect.
+        this.#earlyPayloads = remainder.length > 0 ? [remainder] : [];
         r();
-        /* istanbul ignore next -- servers ordinarily send handshake and hub frames separately */
-        if (remainder.length > 0) this.#processProtocolPayload(remainder);
       } catch (err) {
-        clearTimeout(this.#handshakeTimer!);
-        const r = this.#handshakeRejecter!;
-        this.#handshakeResolver = null;
-        this.#handshakeRejecter = null;
         /* istanbul ignore next -- JSON.parse and protocol validation throw Error objects */
-        r(err instanceof Error ? err : new Error(String(err)));
-        return;
+        this.#failHandshake(err instanceof Error ? err : new Error(String(err)));
       }
       return;
     }
 
     this.#processProtocolPayload(bytes);
+  }
+
+  #flushEarlyPayloads(): void {
+    const payloads = this.#earlyPayloads;
+    this.#earlyPayloads = null;
+    // Anything after a Close, or after an onreconnected callback stopped the
+    // connection, has nowhere to go.
+    for (const payload of payloads!) {
+      if (this.#state === HubConnectionState.Connected) this.#processProtocolPayload(payload);
+    }
   }
 
   #processProtocolPayload(bytes: Uint8Array): void {
@@ -716,9 +805,11 @@ export class HubConnection {
     if (!handlers || handlers.size === 0) {
       this.#logger.log(LogLevel.Warning, `No handler for "${msg.target}".`);
       if (msg.invocationId) {
-        await this.#send(this.#encode(JsonHubProtocol.completion(
-          msg.invocationId, undefined, `No client handler registered for '${msg.target}'.`,
-        ))).catch(/* istanbul ignore next -- completion replies are best-effort */ () => {});
+        await this.#sendCompletion({
+          type: MessageType.Completion,
+          invocationId: msg.invocationId,
+          error: `No client handler registered for '${msg.target}'.`,
+        });
       }
       return;
     }
@@ -735,15 +826,31 @@ export class HubConnection {
       }
     }
     if (msg.invocationId) {
-      const completion: HubMessage = invocationError
+      await this.#sendCompletion(invocationError
         ? { type: MessageType.Completion, invocationId: msg.invocationId, error: invocationError.message }
         : {
             type: MessageType.Completion,
             invocationId: msg.invocationId,
             ...(result !== undefined && { result }),
-          };
-      await this.#send(this.#encode(completion)).catch(/* istanbul ignore next -- completion replies are best-effort */ () => {});
+          });
     }
+  }
+
+  /** Best-effort: the connection may have closed while the handler ran. */
+  async #sendCompletion(completion: CompletionMessage): Promise<void> {
+    let encoded: string | Uint8Array;
+    try {
+      encoded = this.#encode(completion);
+    } catch (err) {
+      encoded = this.#encode({
+        type: MessageType.Completion,
+        invocationId: completion.invocationId,
+        error: `The handler result could not be serialized: ${(err as Error).message}`,
+      });
+    }
+    await this.#send(encoded).catch((err: Error) => {
+      this.#logger.log(LogLevel.Debug, `Could not send a completion: ${err.message}`);
+    });
   }
 
   // ─── Internal: transport closed ──────────────────────────────────────────
@@ -753,6 +860,11 @@ export class HubConnection {
        calling ws.close(), so the close handler never invokes onclose once
        stop() has set #stopping; this guard is a belt-and-suspenders defence. */
     if (this.#stopping) return;
+    // Whoever is waiting for the handshake decides what happens next.
+    if (this.#handshakeResolver) {
+      this.#failHandshake(err ?? new Error('The connection closed during the handshake.'));
+      return;
+    }
     this.#logger.log(
       LogLevel.Warning,
       err ? `Transport closed with error: ${err.message}` : 'Transport closed.'
@@ -773,11 +885,7 @@ export class HubConnection {
    */
   #abandonTransportAndReconnect(err: Error | null): void {
     this.#clearTimers();
-    const t = this.#transport;
-    /* istanbul ignore next - #transport is always non-null here; null
-       is a defensive guard against theoretical concurrent nulling. */
-    if (t) t.onclose = null;
-    this.#transport = null;
+    const t = this.#detachTransport();
     this.#rejectAllPending(err ?? new AbortError('Connection closed while reconnecting.'));
     void t?.stop().catch(
       /* istanbul ignore next -- shutdown of an abandoned transport is best-effort */
@@ -788,22 +896,45 @@ export class HubConnection {
 
   #stopWithError(err: Error | null): void {
     this.#clearTimers();
-    void this.#transport?.stop().catch(
+    void this.#detachTransport()?.stop().catch(
       /* istanbul ignore next -- error shutdown is best-effort */
       () => { /* ignore */ },
     );
-    this.#transport = null;
     this.#completeClose(err ?? undefined);
+  }
+
+  /** Disown the transport, so nothing it still does reaches this connection. */
+  #detachTransport(): ITransport | null {
+    const transport = this.#transport;
+    if (transport) {
+      transport.onclose   = null;
+      transport.onreceive = null;
+    }
+    this.#transport = null;
+    return transport;
+  }
+
+  /** Undo whatever a failed start or reconnect attempt left behind. */
+  async #abandonAttempt(): Promise<void> {
+    this.#clearTimers();
+    this.#handshakeResolver = null;
+    this.#handshakeRejecter = null;
+    this.#handshakeBuffer   = Buffer.alloc(0);
+    this.#earlyPayloads     = null;
+    await this.#detachTransport()?.stop().catch(/* istanbul ignore next -- cleanup is best-effort */ () => {});
   }
 
   #completeClose(err?: Error): void {
     const closeErr = err ?? new AbortError('Connection closed.');
     this.#rejectAllPending(closeErr);
     this.#state = HubConnectionState.Disconnected;
+    this.#connectionId    = null;
+    this.#connectionToken = null;
+    // Before the callbacks, as one of them may call start().
+    void this.#closeOwnedDispatcher();
     for (const cb of this.#closedCallbacks) {
       try { cb(err); } catch { /* ignore */ }
     }
-    void this.#closeOwnedDispatcher();
   }
 
   #rejectAllPending(err: Error): void {
@@ -817,6 +948,8 @@ export class HubConnection {
 
   async #doReconnect(disconnectError: Error | null): Promise<void> {
     this.#state = HubConnectionState.Reconnecting;
+    const attempt = new AbortController();
+    this.#attempt = attempt;
     for (const cb of this.#reconnectingCallbacks) {
       try { cb(disconnectError ?? undefined); } catch { /* ignore */ }
     }
@@ -831,25 +964,36 @@ export class HubConnection {
         elapsedMilliseconds: Date.now() - startTime,
         retryReason:         lastError,
       };
-      const delay = this.#reconnectPolicy!.nextRetryDelayInMilliseconds(ctx);
+      let delay: number | null;
+      try {
+        delay = this.#reconnectPolicy!.nextRetryDelayInMilliseconds(ctx);
+      } catch (err) {
+        /* istanbul ignore next -- policies throw Error objects */
+        lastError = err instanceof Error ? err : new Error(String(err));
+        this.#logger.log(LogLevel.Error, `Reconnect policy threw: ${lastError.message}`);
+        break;
+      }
       if (delay === null) {
         this.#logger.log(LogLevel.Debug, 'Reconnect policy returned null - giving up.');
         break;
       }
 
       this.#logger.log(LogLevel.Information, `Reconnecting in ${delay} ms (attempt ${retryCount + 1}).`);
-      await sleep(delay);
+      await sleep(delay, attempt.signal);
       if (this.#stopping) break;
 
       try {
-        await this.#startInternal();
+        await this.#startInternal(attempt.signal);
+        this.#attempt = null;
         this.#state = HubConnectionState.Connected;
         this.#logger.log(LogLevel.Information, 'Reconnected successfully.');
         for (const cb of this.#reconnectedCallbacks) {
           try { cb(this.#connectionId); } catch { /* ignore */ }
         }
+        this.#flushEarlyPayloads();
         return;
       } catch (err) {
+        await this.#abandonAttempt();
         retryCount++;
         /* istanbul ignore next - #startInternal() only throws Error instances. */
         lastError = err instanceof Error ? err : new Error(String(err));
@@ -857,6 +1001,7 @@ export class HubConnection {
       }
     }
 
+    this.#attempt = null;
     // stop() during a reconnect has already closed the connection.
     if (this.#stopping) return;
     this.#completeClose(lastError ?? undefined);
@@ -907,8 +1052,9 @@ export class HubConnection {
   // ─── Internal: helpers ────────────────────────────────────────────────────
 
   #send(message: string | Uint8Array): Promise<void> {
+    if (!this.#transport) return Promise.reject(new Error('The connection has no active transport.'));
     this.#resetPingTimer();
-    return this.#transport!.send(message);
+    return this.#transport.send(message);
   }
 
   #encode(message: HubMessage): string | Uint8Array {
@@ -929,11 +1075,19 @@ export class HubConnection {
   }
 
   async #closeOwnedDispatcher(): Promise<void> {
-    if (!this.#ownsDispatcher || !this.#dispatcher) return;
-    this.#dispatcherClosePromise ??= this.#dispatcher.close().catch(
+    if (!this.#dispatcherFactory) return;
+    this.#dispatcherClosePromise ??= this.#dispatcher!.close().catch(
       /* istanbul ignore next -- shutdown cleanup is best-effort */ () => {},
     );
     await this.#dispatcherClosePromise;
+  }
+
+  /** Replace an owned dispatcher the previous connection closed. */
+  #renewDispatcher(): void {
+    if (!this.#dispatcherFactory || !this.#dispatcherClosePromise) return;
+    this.#dispatcherClosePromise = null;
+    this.#dispatcher = this.#dispatcherFactory();
+    if (!this.#customHttp) this.#http = this.#createHttpClient();
   }
 }
 
@@ -956,6 +1110,28 @@ function appendParam(url: string, name: string, value: string): string {
   return u.toString();
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** Wait `ms`, or until `signal` aborts. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
+}
+
+/** Settle with `promise`, or reject with the abort reason if `signal` aborts first. */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason as Error);
+    signal.addEventListener('abort', onAbort, { once: true });
+    const cleanup = (): void => signal.removeEventListener('abort', onAbort);
+    promise.then(
+      (value) => { cleanup(); resolve(value); },
+      (error: unknown) => { cleanup(); reject(error as Error); },
+    );
+  });
 }

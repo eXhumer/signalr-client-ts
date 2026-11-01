@@ -39,12 +39,14 @@
 import { describe, it, beforeAll, afterAll, afterEach, expect, vi } from 'vitest';
 import * as http from 'node:http';
 import * as net  from 'node:net';
+import { PassThrough } from 'node:stream';
 import { Agent } from 'undici';
 
 import { ServerSentEventsTransport } from '../../src/transports/sse-transport.js';
 import { TransferFormat }            from '../../src/constants.js';
-import { RequestHttpClient }         from '../../src/http-client.js';
+import { RequestHttpClient, type RequestOptions } from '../../src/http-client.js';
 import { MockLogger }                from '../helpers/mock-logger.js';
+import type { IHttpClient } from '../../src/interfaces.js';
 import { closeTrackedDispatchers, trackDispatcher } from '../helpers/dispatcher-tracker.js';
 
 afterEach(closeTrackedDispatchers);
@@ -706,5 +708,63 @@ describe('ServerSentEventsTransport', () => {
 
     await transport.stop();
     res.end();
+  });
+});
+
+describe('ServerSentEventsTransport stream handling', () => {
+  function connected(body: PassThrough, post: IHttpClient['post'] = vi.fn(), maximum?: number) {
+    const abort = vi.fn(() => body.destroy(new Error('aborted')));
+    const client = {
+      stream: async () => ({ statusCode: 200, headers: {}, body, abort }),
+      post,
+    } as unknown as IHttpClient;
+    return { abort, transport: new ServerSentEventsTransport(client, null, new MockLogger(), {}, maximum) };
+  }
+
+  it('sends one POST at a time, in order', async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const first = new Promise<void>((resolve) => { release = resolve; });
+    const post = vi.fn(async (_url: string, options?: RequestOptions) => {
+      order.push(`start ${String(options?.body)}`);
+      if (options?.body === 'a') await first;
+      order.push(`end ${String(options?.body)}`);
+      return { status: 200, headers: {}, body: '' };
+    });
+    const { transport } = connected(new PassThrough(), post);
+    await transport.connect('http://hub.test/', TransferFormat.Text);
+
+    const sends = Promise.all([transport.send('a'), transport.send('b')]);
+    await vi.waitFor(() => expect(order).toEqual(['start a']));
+    release();
+    await sends;
+
+    expect(order).toEqual(['start a', 'end a', 'start b', 'end b']);
+  });
+
+  it('carries on after a failed POST', async () => {
+    const post = vi.fn()
+      .mockResolvedValueOnce({ status: 500, headers: {}, body: '' })
+      .mockResolvedValueOnce({ status: 200, headers: {}, body: '' });
+    const { transport } = connected(new PassThrough(), post);
+    await transport.connect('http://hub.test/', TransferFormat.Text);
+
+    await expect(transport.send('a')).rejects.toThrow(/500/);
+    await expect(transport.send('b')).resolves.toBeUndefined();
+  });
+
+  it('closes once when an event passes the size limit', async () => {
+    const body = new PassThrough();
+    const { abort, transport } = connected(body, vi.fn(), 10);
+    const onclose = vi.fn();
+    transport.onclose = onclose;
+    await transport.connect('http://hub.test/', TransferFormat.Text);
+
+    body.write('data: more than ten characters');
+    await vi.waitFor(() => expect(abort).toHaveBeenCalled());
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onclose).toHaveBeenCalledTimes(1);
+    expect(onclose.mock.calls[0]![0].message).toMatch(/exceeds 10 characters/);
   });
 });

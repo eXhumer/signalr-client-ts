@@ -55,8 +55,8 @@ export class UnsupportedTransportError extends Error {
   override readonly name = 'UnsupportedTransportError' as const;
   readonly transport: number | null;
 
-  constructor(message: string, transport: number | null) {
-    super(message);
+  constructor(message: string, transport: number | null, options?: ErrorOptions) {
+    super(message, options);
     this.transport = transport;
     Object.setPrototypeOf(this, new.target.prototype);
   }

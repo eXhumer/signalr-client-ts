@@ -29,9 +29,10 @@
  * • `CloseEvent.code` / `.reason` behave identically to the browser.
  */
 
-import { WebSocket } from 'undici';
+import { getGlobalDispatcher, WebSocket } from 'undici';
 import type { Dispatcher } from 'undici';
 import { TransferFormat, LogLevel } from '../constants.js';
+import { TransportError } from '../errors.js';
 import type { ITransport, ILogger } from '../interfaces.js';
 
 // ─── ReadyState constants (mirrors window.WebSocket) ─────────────────────────
@@ -45,6 +46,38 @@ export const WebSocketReadyState = Object.freeze({
 
 export type WebSocketReadyState =
   (typeof WebSocketReadyState)[keyof typeof WebSocketReadyState];
+
+/** The error behind a WebSocket `error` event. */
+function errorFromEvent(event: Event): Error {
+  // ErrorEvent is a browser DOM global absent from Node.js lib targets.
+  // Cast to a structural equivalent to access `.error` / `.message`.
+  const e = event as Event & { error?: unknown; message?: string };
+  if (!(e.error instanceof Error)) return new Error(String(e.message ?? 'WebSocket error'));
+  // undici sometimes wraps the real network error (e.g. ECONNREFUSED) inside
+  // `error.cause` and leaves `error.message` as an empty string.  Prefer the
+  // cause so callers see a meaningful message rather than ''.
+  if (e.error.message) return e.error;
+  return e.error.cause instanceof Error ? e.error.cause : new Error('WebSocket connection failed');
+}
+
+/**
+ * Reports the status of a rejected upgrade. undici's error event leaves it out,
+ * and a 101 goes to `onRequestUpgrade`, so this only sees rejections.
+ */
+function rejectedStatus(report: (status: number) => void): Dispatcher.DispatcherComposeInterceptor {
+  return (dispatch) => (opts, handler) => dispatch(opts, new Proxy(handler, {
+    get(target, key) {
+      if (key === 'onResponseStart') {
+        return (...args: Parameters<NonNullable<Dispatcher.DispatchHandler['onResponseStart']>>) => {
+          report(args[1]);
+          target.onResponseStart?.(...args);
+        };
+      }
+      const value: unknown = Reflect.get(target, key);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }));
+}
 
 // ─── Transport implementation ─────────────────────────────────────────────────
 
@@ -117,9 +150,12 @@ export class WebSocketTransport implements ITransport {
     // ── Open the WebSocket ──────────────────────────────────────────────────
     // undici's WebSocket constructor accepts headers + dispatcher as its
     // second argument.  These are undici-specific extensions to the spec.
+    let upgradeStatus: number | undefined;
     const ws = new WebSocket(wsUrl, {
       headers,
-      ...(this.#dispatcher !== undefined && { dispatcher: this.#dispatcher }),
+      dispatcher: (this.#dispatcher ?? getGlobalDispatcher()).compose(
+        rejectedStatus((status) => { upgradeStatus = status; }),
+      ),
     } as ConstructorParameters<typeof WebSocket>[1]);
 
     this.#ws = ws;
@@ -158,23 +194,9 @@ export class WebSocketTransport implements ITransport {
 
       const onError = (event: Event): void => {
         cleanup();
-        // ErrorEvent is a browser DOM global absent from Node.js lib targets.
-        // Cast to a structural equivalent to access `.error` / `.message`.
-        const e = event as Event & { error?: unknown; message?: string };
-        let err: Error;
-        if (e.error instanceof Error) {
-          // undici sometimes wraps the real network error (e.g. ECONNREFUSED)
-          // inside `error.cause` and leaves `error.message` as an empty string.
-          // Prefer the cause when the outer message is empty so callers see a
-          // meaningful message (ECONNREFUSED, etc.) rather than ''.
-          err = e.error.message
-            ? e.error
-            : (e.error.cause instanceof Error
-                ? e.error.cause
-                : new Error('WebSocket connection failed'));
-        } else {
-          err = new Error(String(e.message ?? 'WebSocket error'));
-        }
+        const err = upgradeStatus === undefined
+          ? errorFromEvent(event)
+          : new TransportError(`WebSocket upgrade failed with status code ${upgradeStatus}.`, upgradeStatus);
         this.#logger.log(LogLevel.Error, `(WebSockets transport) Error during connect: ${err.message}`);
         this.#ws = null;
         ws.close();
@@ -195,18 +217,18 @@ export class WebSocketTransport implements ITransport {
       // Only call onclose for unexpected closures (not our own stop() call).
       if (this.#ws !== null) {
         this.#ws = null;
-        this.onclose?.();
+        // 1000 is a normal closure, and 1005 a Close frame with no status.
+        const clean = closeEvent.code === 1000 || closeEvent.code === 1005;
+        this.onclose?.(clean ? undefined : new Error(
+          `WebSocket closed with status code ${closeEvent.code} (${closeEvent.reason || 'no reason given'}).`,
+        ));
       }
     });
 
     ws.addEventListener('error', (event) => {
       // Errors after the initial open.
-      // Same structural-cast pattern as above: ErrorEvent not in Node lib.
       if (ws.readyState !== WebSocket.CONNECTING) {
-        const e   = event as Event & { error?: unknown; message?: string };
-        const err = e.error instanceof Error
-          ? e.error
-          : new Error(String(e.message ?? 'WebSocket error'));
+        const err = errorFromEvent(event);
         this.#logger.log(LogLevel.Error, `(WebSockets transport) Error: ${err.message}`);
         // Null #ws BEFORE calling onclose so the 'close' event handler that
         // fires next sees this.#ws === null and does not call onclose a second

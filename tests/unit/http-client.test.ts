@@ -15,7 +15,7 @@
  *   DispatchHttpClient  - Dispatcher#dispatch()  (default / HttpClient alias)
  */
 
-import { describe, it, beforeAll, afterAll, beforeEach, afterEach, expect } from 'vitest';
+import { describe, it, beforeAll, afterAll, beforeEach, afterEach, expect, vi } from 'vitest';
 import * as http from 'node:http';
 import * as net  from 'node:net';
 import { Agent } from 'undici';
@@ -526,5 +526,88 @@ describe('DispatchHttpClient resource limits and backpressure', () => {
     result.body.emit('drain');
     expect(resumed).toBe(true);
     result.abort();
+  });
+});
+
+// ─── Limits and cancellation, for every client ────────────────────────────────
+
+describe.each([
+  ['RequestHttpClient',  RequestHttpClient],
+  ['FetchHttpClient',    FetchHttpClient],
+  ['StreamHttpClient',   StreamHttpClient],
+  ['PipelineHttpClient', PipelineHttpClient],
+  ['DispatchHttpClient', DispatchHttpClient],
+])('%s limits and cancellation', (_label, Client) => {
+  let server: http.Server;
+  let url: string;
+  let received: http.IncomingMessage[];
+
+  beforeEach(async () => {
+    received = [];
+    server = http.createServer((req, res) => {
+      received.push(req);
+      if (req.url === '/hold') return;
+      if (req.url === '/empty') { res.writeHead(204); res.end(); return; }
+      res.writeHead(200);
+      res.write('x'.repeat(64));
+      // Never ends: only stopping at the limit can settle the request.
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    url = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`;
+  });
+
+  afterEach(async () => {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  it('gives up as soon as a buffered body passes the limit', async () => {
+    const client = new Client({ maximumResponseBodySize: 16, dispatcher: trackDispatcher(new Agent()) });
+
+    await expect(client.get(`${url}/big`)).rejects.toThrow(/byte limit/i);
+  });
+
+  it('cancels a stream still waiting for headers', async () => {
+    const client = new Client({ dispatcher: trackDispatcher(new Agent()) });
+    const abort = new AbortController();
+
+    const streaming = client.stream('GET', `${url}/hold`, { signal: abort.signal });
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    abort.abort();
+
+    await expect(streaming).rejects.toThrow();
+  });
+
+  it('streams an empty 204', async () => {
+    const client = new Client({ dispatcher: trackDispatcher(new Agent()) });
+
+    const { statusCode, body } = await client.stream('GET', `${url}/empty`);
+    const chunks: unknown[] = [];
+    for await (const chunk of body) chunks.push(chunk);
+
+    expect(statusCode).toBe(204);
+    expect(chunks).toEqual([]);
+  });
+
+  it('buffers an empty 204', async () => {
+    const client = new Client({ dispatcher: trackDispatcher(new Agent()) });
+
+    expect((await client.get(`${url}/empty`)).body).toBe('');
+  });
+});
+
+describe('DispatchHttpClient stream cancellation', () => {
+  it('honours a signal that aborted before the request started', async () => {
+    const server = http.createServer(() => {});
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}/`;
+    const client = new DispatchHttpClient({ dispatcher: trackDispatcher(new Agent()) });
+    const abort = new AbortController();
+    abort.abort(new Error('too late'));
+
+    await expect(client.stream('GET', url, { signal: abort.signal })).rejects.toThrow('too late');
+
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
   });
 });

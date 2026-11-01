@@ -59,6 +59,8 @@ export interface RequestOptions {
   readonly body?:    string | Uint8Array | Record<string, unknown> | null;
   /** Override the session-level timeout for this single request (ms). */
   readonly timeout?: number;
+  /** Cancels a `stream()` call, including while it waits for response headers. */
+  readonly signal?:  AbortSignal;
 }
 
 /**
@@ -143,10 +145,20 @@ function normaliseHeaders(
   return h as Record<string, string | string[] | undefined>;
 }
 
-function assertBodySize(size: number, maximum: number): void {
-  if (size > maximum) {
-    throw new Error(`HTTP response body exceeds the ${maximum} byte limit.`);
+function bodySizeError(maximum: number): Error {
+  return new Error(`HTTP response body exceeds the ${maximum} byte limit.`);
+}
+
+/** Read a body as text, giving up as soon as it passes `maximum` bytes. */
+async function readBody(body: AsyncIterable<Uint8Array>, maximum: number): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for await (const chunk of body) {
+    size += chunk.length;
+    if (size > maximum) throw bodySizeError(maximum);
+    chunks.push(chunk);
   }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 // ─── Abstract base ────────────────────────────────────────────────────────────
@@ -247,8 +259,7 @@ export class RequestHttpClient extends BaseUndiciClient {
       dispatcher:     this.dispatcher,
     });
 
-    const text = await body.text();
-    assertBodySize(Buffer.byteLength(text), this.maximumResponseBodySize);
+    const text = await readBody(body, this.maximumResponseBodySize);
 
     return {
       status:  statusCode,
@@ -280,6 +291,7 @@ export class RequestHttpClient extends BaseUndiciClient {
       // No bodyTimeout here - SSE connections are intentionally long-lived.
       headersTimeout: options.timeout ?? this.defaultTimeout,
       dispatcher:     this.dispatcher,
+      ...(options.signal !== undefined && { signal: options.signal }),
     });
 
     return {
@@ -339,8 +351,9 @@ export class FetchHttpClient extends BaseUndiciClient {
         dispatcher: this.dispatcher,
       } as unknown as Parameters<typeof undiciFetch>[1]);
 
-      const text = await res.text();
-      assertBodySize(Buffer.byteLength(text), this.maximumResponseBodySize);
+      const text = res.body
+        ? await readBody(res.body as AsyncIterable<Uint8Array>, this.maximumResponseBodySize)
+        : '';
       if (timer !== null) clearTimeout(timer);
 
       // Convert Headers object to plain Record
@@ -370,14 +383,14 @@ export class FetchHttpClient extends BaseUndiciClient {
       method,
       headers,
       ...(buf !== null && { body: buf }),
-      signal:     ac.signal,
+      signal:     options.signal ? AbortSignal.any([ac.signal, options.signal]) : ac.signal,
       dispatcher: this.dispatcher,
     } as unknown as Parameters<typeof undiciFetch>[1]);
 
-    // Convert WHATWG ReadableStream → Node Readable
-    const body = Readable.fromWeb(
-      res.body as Parameters<typeof Readable.fromWeb>[0],
-    );
+    // Convert WHATWG ReadableStream → Node Readable. A 204 has no body at all.
+    const body = res.body
+      ? Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0])
+      : Readable.from([]);
 
     const respHeaders: Record<string, string | string[] | undefined> = {};
     res.headers.forEach((value, key) => { respHeaders[key] = value; });
@@ -423,6 +436,7 @@ export class StreamHttpClient extends BaseUndiciClient {
     let statusCode = 0;
     let respHeaders: Record<string, string | string[]> = {};
     const chunks: Buffer[] = [];
+    let size = 0;
 
     return undiciStream(
       url,
@@ -440,17 +454,17 @@ export class StreamHttpClient extends BaseUndiciClient {
 
         // Sink that collects the response bytes
         const sink = new PassThrough();
-        sink.on('data', (chunk: Buffer) => chunks.push(chunk));
+        sink.on('data', (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > this.maximumResponseBodySize) sink.destroy(bodySizeError(this.maximumResponseBodySize));
+          else chunks.push(chunk);
+        });
         return sink;
       },
     ).then(() => ({
       status:  statusCode,
       headers: normaliseHeaders(respHeaders),
-      body:    (() => {
-        const body = Buffer.concat(chunks);
-        assertBodySize(body.length, this.maximumResponseBodySize);
-        return body.toString('utf8');
-      })(),
+      body:    Buffer.concat(chunks).toString('utf8'),
     }));
   }
 
@@ -477,6 +491,7 @@ export class StreamHttpClient extends BaseUndiciClient {
           ...(buf !== null && { body: buf }),
           headersTimeout: options.timeout ?? this.defaultTimeout,
           dispatcher:     this.dispatcher,
+          ...(options.signal !== undefined && { signal: options.signal }),
         },
         ({ statusCode, headers: h }) => {
           resolve({
@@ -537,6 +552,7 @@ export class PipelineHttpClient extends BaseUndiciClient {
       let statusCode  = 0;
       let respHeaders: Record<string, string | string[]> = {};
       const chunks: Buffer[] = [];
+      let size = 0;
 
       const duplex = undiciPipeline(
         url,
@@ -556,16 +572,16 @@ export class PipelineHttpClient extends BaseUndiciClient {
         },
       );
 
-      duplex.on('data',  (chunk: Buffer) => chunks.push(chunk));
+      duplex.on('data',  (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > this.maximumResponseBodySize) duplex.destroy(bodySizeError(this.maximumResponseBodySize));
+        else chunks.push(chunk);
+      });
       duplex.on('end',   () =>
         resolve({
           status:  statusCode,
           headers: normaliseHeaders(respHeaders),
-          body:    (() => {
-            const body = Buffer.concat(chunks);
-            assertBodySize(body.length, this.maximumResponseBodySize);
-            return body.toString('utf8');
-          })(),
+          body:    Buffer.concat(chunks).toString('utf8'),
         }),
       );
       duplex.on('error', reject);
@@ -604,6 +620,7 @@ export class PipelineHttpClient extends BaseUndiciClient {
           ...(buf !== null && { body: buf }),
           headersTimeout: options.timeout ?? this.defaultTimeout,
           dispatcher:     this.dispatcher,
+          ...(options.signal !== undefined && { signal: options.signal }),
         },
         ({ statusCode, headers: h, body }) => {
           if (!resolved) {
@@ -766,6 +783,9 @@ export class DispatchHttpClient extends BaseUndiciClient {
       const pt = new PassThrough();
 
       let controller: Dispatcher.DispatchController | null = null;
+      const { signal } = options;
+      const onAbort = (): void => controller?.abort(signal!.reason as Error);
+      signal?.addEventListener('abort', onAbort, { once: true });
 
       this.dispatcher.dispatch(
         {
@@ -779,9 +799,11 @@ export class DispatchHttpClient extends BaseUndiciClient {
         {
           onRequestStart: (ctrl: Dispatcher.DispatchController, _context: unknown): void => {
             controller = ctrl;
+            if (signal?.aborted) onAbort();
           },
 
           onResponseError: (_ctrl: Dispatcher.DispatchController, err: Error): void => {
+            signal?.removeEventListener('abort', onAbort);
             if (!resolved) {
               // Promise not yet resolved: reject it. The PassThrough stream has
               // not been handed to the caller yet, so destroy it silently to
@@ -823,6 +845,7 @@ export class DispatchHttpClient extends BaseUndiciClient {
           },
 
           onResponseEnd: (_ctrl: Dispatcher.DispatchController, _trailers: Record<string, string | string[] | undefined>): void => {
+            signal?.removeEventListener('abort', onAbort);
             pt.end();
           },
         } satisfies Dispatcher.DispatchHandler,

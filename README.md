@@ -129,6 +129,8 @@ await jar.setCookie('session=abc123', 'https://example.com');
 builder.withCookies(jar);
 ```
 
+The connection closes its cookie dispatcher when it ends and creates a new one on the next `start()`, so a stopped connection can be started again with the same jar. A client from `withHttpClient()` doesn't go through this dispatcher: negotiate and HTTP transport requests then skip the jar, and the builder logs a warning.
+
 `withCookies()` and `withDispatcher()` are mutually exclusive. To combine cookie support with a custom dispatcher, compose the `cookie` interceptor instead - see [Cookie handling with a custom dispatcher](#cookie-handling-with-a-custom-dispatcher).
 
 ### `.withDispatcher(dispatcher)`
@@ -180,7 +182,11 @@ await connection.start();   // Negotiate, pick transport, perform handshake
 await connection.stop();    // Graceful shutdown
 ```
 
-`start()` throws if the connection is not in the `Disconnected` state.
+`start()` rejects if the connection is not in the `Disconnected` state.
+
+`stop()` also cancels a start or reconnect in progress. A `start()` still pending rejects with an `AbortError`, and `onclose` fires only if the connection had got as far as connecting. Calling `stop()` while it is already stopping returns the same promise.
+
+`invoke()` and `send()` reject when the connection is not `Connected`. `stream()` reports it through the subscriber's `error` callback.
 
 #### State
 
@@ -296,7 +302,7 @@ import { ProxyAgent } from 'undici';
 import { HubConnectionBuilder, CookieJar, cookie } from '@exhumer/signalr-client';
 
 const jar   = new CookieJar();
-const agent = new ProxyAgent('http://proxy:8080').compose(cookie({ jar }));
+const agent = new ProxyAgent('http://proxy:8080').compose(cookie({ cookies: { jar } }));
 
 const connection = new HubConnectionBuilder()
   .withUrl('https://example.com/hub')

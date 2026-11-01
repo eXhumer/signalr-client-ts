@@ -12,15 +12,11 @@
  * so the test has full visibility into what the client sent and can send
  * precisely crafted frames back.
  *
- * Why not the raw-TCP approach from ws-client.test.ts?
- * ─────────────────────────────────────────────────────
- * The old WebSocketClient connected at the TCP level and sent a hand-crafted
- * HTTP upgrade request.  undici's built-in WebSocket uses the higher-level
- * `http.ClientRequest` path internally, so it works correctly against a
- * proper `http.Server` that fires the `upgrade` event.  A raw `net.Server`
- * also works (undici sends a standard HTTP/1.1 upgrade), but using
- * `http.Server` lets us inspect request headers (Authorization, etc.) more
- * easily.
+ * Why `http.Server`?
+ * ───────────────────
+ * A raw `net.Server` also works (undici sends a standard HTTP/1.1 upgrade),
+ * but using `http.Server` lets us inspect request headers (Authorization,
+ * etc.) more easily.
  *
  * Behaviors under test
  * ────────────────────

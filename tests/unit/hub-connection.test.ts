@@ -162,9 +162,9 @@ describe('HubConnection - send / invoke', () => {
       'fire-and-forget should have no invocationId').toBeTruthy();
   });
 
-  it('send() throws when not connected', async () => {
+  it('send() rejects when not connected', async () => {
     const c2 = new HubConnectionBuilder().withUrl(srv.url).build();
-    expect(() => c2.send('Foo')).toThrow(/Connected/);
+    await expect(c2.send('Foo')).rejects.toThrow(/Connected/);
   });
 
   // ── invoke ───────────────────────────────────────────────────────────

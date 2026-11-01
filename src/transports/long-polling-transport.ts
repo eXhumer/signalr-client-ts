@@ -17,6 +17,7 @@ import type { Readable } from 'node:stream';
 
 /** How long a single poll GET can hang before we issue a new one. */
 const POLL_TIMEOUT_MS = 100_000;
+const DEFAULT_MAXIMUM_MESSAGE_SIZE = 32 * 1024 * 1024;
 
 export class LongPollingTransport implements ITransport {
   readonly name = 'LongPolling' as const;
@@ -25,11 +26,16 @@ export class LongPollingTransport implements ITransport {
   readonly #accessTokenFactory:  (() => Promise<string | null>) | null;
   readonly #logger:              ILogger;
   readonly #extraHeaders:        Record<string, string>;
+  readonly #maximumMessageSize:  number;
 
   #url:           string | null = null;
   #running:       boolean       = false;
   #pollImmediate: ReturnType<typeof setImmediate> | null = null;
   #activeAbort:   (() => void) | null = null;
+  /** Cancels a poll still waiting for response headers. */
+  #pollAbort:     AbortController | null = null;
+  /** Keeps POSTs in the order they were sent. */
+  #sendQueue:     Promise<unknown> = Promise.resolve();
   #transferFormat: TransferFormat = TransferFormat.Text;
 
   onreceive: ((data: string | Uint8Array) => void) | null = null;
@@ -40,11 +46,13 @@ export class LongPollingTransport implements ITransport {
     accessTokenFactory:  (() => Promise<string | null>) | null,
     logger:              ILogger,
     extraHeaders:        Record<string, string> = {},
+    maximumMessageSize:  number = DEFAULT_MAXIMUM_MESSAGE_SIZE,
   ) {
     this.#httpClient         = httpClient;
     this.#accessTokenFactory = accessTokenFactory;
     this.#logger             = logger;
     this.#extraHeaders       = extraHeaders;
+    this.#maximumMessageSize = maximumMessageSize;
   }
 
   async connect(url: string, transferFormat: TransferFormat): Promise<void> {
@@ -61,7 +69,13 @@ export class LongPollingTransport implements ITransport {
     this.#logger.log(LogLevel.Information, '(LongPolling transport) Connected.');
   }
 
-  async send(data: string | Uint8Array): Promise<void> {
+  send(data: string | Uint8Array): Promise<void> {
+    const sending = this.#sendQueue.then(() => this.#post(data));
+    this.#sendQueue = sending.catch(() => {});
+    return sending;
+  }
+
+  async #post(data: string | Uint8Array): Promise<void> {
     if (!this.#running || !this.#url) {
       throw new Error('LongPolling transport is not connected.');
     }
@@ -87,6 +101,8 @@ export class LongPollingTransport implements ITransport {
       this.#pollImmediate = null;
     }
 
+    this.#pollAbort?.abort();
+    this.#pollAbort = null;
     this.#activeAbort?.();
     this.#activeAbort = null;
 
@@ -138,9 +154,12 @@ export class LongPollingTransport implements ITransport {
   async #poll(url: string, isConnect: boolean): Promise<void> {
     const headers = await this.#buildHeaders();
 
+    const pollAbort = new AbortController();
+    this.#pollAbort = pollAbort;
+
     let res;
     try {
-      res = await this.#httpClient.stream('GET', url, { headers, timeout: POLL_TIMEOUT_MS });
+      res = await this.#httpClient.stream('GET', url, { headers, timeout: POLL_TIMEOUT_MS, signal: pollAbort.signal });
       this.#activeAbort = res.abort;
     } catch (err) {
       if (!this.#running) return; // normal stop - swallow
@@ -149,7 +168,7 @@ export class LongPollingTransport implements ITransport {
 
     if (res.statusCode === 204) {
       // Server ended connection gracefully
-      await readAll(res.body);
+      await readAll(res.body, this.#maximumMessageSize);
       this.#activeAbort = null;
       this.#logger.log(LogLevel.Information, '(LongPolling transport) Server closed (204).');
       this.#running = false;
@@ -158,7 +177,7 @@ export class LongPollingTransport implements ITransport {
     }
 
     if (res.statusCode < 200 || res.statusCode >= 300) {
-      await readAll(res.body);
+      await readAll(res.body, this.#maximumMessageSize);
       this.#activeAbort = null;
       const err = new Error(`Long polling received unexpected status ${res.statusCode}.`);
       if (!isConnect) {
@@ -172,11 +191,11 @@ export class LongPollingTransport implements ITransport {
 
     let body: Buffer;
     try {
-      body = await readAll(res.body);
+      body = await readAll(res.body, this.#maximumMessageSize);
     } catch (err) {
       /* istanbul ignore next -- only an explicit stop aborts the active body */
       if (!this.#running) return;
-      /* istanbul ignore next -- body errors are propagated to the poll loop */
+      res.abort();
       throw err;
     } finally {
       this.#activeAbort = null;
@@ -200,12 +219,19 @@ export class LongPollingTransport implements ITransport {
   }
 }
 
-function readAll(stream: Readable): Promise<Buffer> {
+function readAll(stream: Readable, maximumSize: number): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const chunks: Buffer[] = [];
+    let size = 0;
     stream.on('data', (chunk: Buffer | string) => {
       /* istanbul ignore next -- Node HTTP response streams emit Buffer chunks */
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
+      if (size > maximumSize) {
+        reject(new Error(`Long polling response exceeds ${maximumSize} bytes.`));
+        return;
+      }
+      chunks.push(buffer);
     });
     stream.on('end', () => resolve(Buffer.concat(chunks)));
     stream.on('error', reject);

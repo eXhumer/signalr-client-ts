@@ -60,7 +60,7 @@ import { Readable } from 'node:stream';
 
 import { LongPollingTransport } from '../../src/transports/long-polling-transport.js';
 import { TransferFormat }       from '../../src/constants.js';
-import { RequestHttpClient }    from '../../src/http-client.js';
+import { RequestHttpClient, type RequestOptions } from '../../src/http-client.js';
 import { MockLogger }           from '../helpers/mock-logger.js';
 import type { IHttpClient, HttpResponse } from '../../src/interfaces.js';
 
@@ -704,5 +704,91 @@ describe('LongPollingTransport - request errors and authorization headers', () =
     // The string was wrapped in new Error(String('string-thrown-by-poll'))
     expect(closedErr instanceof Error).toBeTruthy();
     expect(closedErr!.message).toBe('string-thrown-by-poll');
+  });
+});
+
+describe('LongPollingTransport request handling', () => {
+  function respondingClient(stream: IHttpClient['stream'], post: IHttpClient['post'] = vi.fn()): IHttpClient {
+    return { stream, post, delete: vi.fn(async () => ({ status: 202, headers: {}, body: '' })) } as unknown as IHttpClient;
+  }
+  const emptyPoll = async () => ({ statusCode: 200, headers: {}, body: Readable.from([]), abort: () => {} });
+
+  it('sends one POST at a time, in order', async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const first = new Promise<void>((resolve) => { release = resolve; });
+    const post = vi.fn(async (_url: string, options?: RequestOptions) => {
+      order.push(`start ${String(options?.body)}`);
+      if (options?.body === 'a') await first;
+      order.push(`end ${String(options?.body)}`);
+      return { status: 200, headers: {}, body: '' };
+    });
+    const hold = new Promise<never>(() => {});
+    let polls = 0;
+    const transport = new LongPollingTransport(
+      respondingClient(() => (++polls === 1 ? emptyPoll() : hold), post), null, new MockLogger(),
+    );
+    await transport.connect('http://hub.test/', TransferFormat.Text);
+
+    const sends = Promise.all([transport.send('a'), transport.send('b')]);
+    await vi.waitFor(() => expect(order).toEqual(['start a']));
+    release();
+    await sends;
+
+    expect(order).toEqual(['start a', 'end a', 'start b', 'end b']);
+    await transport.stop();
+  });
+
+  it('carries on after a failed POST', async () => {
+    const post = vi.fn()
+      .mockResolvedValueOnce({ status: 500, headers: {}, body: '' })
+      .mockResolvedValueOnce({ status: 200, headers: {}, body: '' });
+    let polls = 0;
+    const transport = new LongPollingTransport(
+      respondingClient(() => (++polls === 1 ? emptyPoll() : new Promise(() => {})), post), null, new MockLogger(),
+    );
+    await transport.connect('http://hub.test/', TransferFormat.Text);
+
+    await expect(transport.send('a')).rejects.toThrow(/500/);
+    await expect(transport.send('b')).resolves.toBeUndefined();
+    await transport.stop();
+  });
+
+  it('cancels a poll waiting for headers on stop()', async () => {
+    let signal: AbortSignal | undefined;
+    let polls = 0;
+    const stream = vi.fn((_method: string, _url: string, options?: RequestOptions) => {
+      if (++polls === 1) return emptyPoll();
+      signal = options?.signal;
+      return new Promise<never>((_, reject) => {
+        signal!.addEventListener('abort', () => reject(new Error('aborted')));
+      });
+    });
+    const transport = new LongPollingTransport(
+      respondingClient(stream as unknown as IHttpClient['stream']), null, new MockLogger(),
+    );
+    await transport.connect('http://hub.test/', TransferFormat.Text);
+    await vi.waitFor(() => expect(signal).toBeDefined());
+
+    await transport.stop();
+
+    expect(signal!.aborted).toBe(true);
+  });
+
+  it('closes when a response passes the size limit', async () => {
+    const abort = vi.fn();
+    let polls = 0;
+    const stream = async () => (++polls === 1
+      ? emptyPoll()
+      : { statusCode: 200, headers: {}, body: Readable.from([Buffer.alloc(8), Buffer.alloc(8)]), abort });
+    const transport = new LongPollingTransport(
+      respondingClient(stream as unknown as IHttpClient['stream']), null, new MockLogger(), {}, 10,
+    );
+    const closed = new Promise<Error | undefined>((resolve) => { transport.onclose = resolve; });
+
+    await transport.connect('http://hub.test/', TransferFormat.Text);
+
+    expect((await closed)?.message).toMatch(/exceeds 10 bytes/);
+    expect(abort).toHaveBeenCalled();
   });
 });

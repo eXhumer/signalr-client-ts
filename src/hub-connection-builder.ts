@@ -108,7 +108,7 @@ export class HubConnectionBuilder {
    * import { cookie, CookieJar } from '@exhumer/signalr-client';
    *
    * const jar   = new CookieJar();
-   * const agent = new ProxyAgent('http://proxy:8080').compose(cookie({ jar }));
+   * const agent = new ProxyAgent('http://proxy:8080').compose(cookie({ cookies: { jar } }));
    *
    * const conn = new HubConnectionBuilder()
    *   .withUrl('https://example.com/hub')
@@ -163,7 +163,7 @@ export class HubConnectionBuilder {
    * `ProxyAgent`, `MockAgent`, etc.
    *
    * To combine a custom dispatcher with automatic cookie handling, use
-   * `createCookieAgentClass()` to build a cookie-aware variant of your
+   * `createCookieAgent()` to build a cookie-aware variant of your
    * dispatcher and pass that here.  Do **not** chain both
    * `withDispatcher()` and `withCookies()` - they are mutually exclusive
    * because `withCookies()` creates its own dispatcher internally.
@@ -200,7 +200,7 @@ export class HubConnectionBuilder {
    *
    * @example
    * ```ts
-   * import { FetchHttpClient } from '@signalr/client';
+   * import { FetchHttpClient } from '@exhumer/signalr-client';
    *
    * const conn = new HubConnectionBuilder()
    *   .withUrl('https://example.com/hub')
@@ -280,14 +280,18 @@ export class HubConnectionBuilder {
       throw new Error('withUrl() must be called before build().');
     }
 
-    // If withCookies() was called, create a CookieAgent as the dispatcher so
-    // that Set-Cookie headers from /negotiate are stored and Cookie headers
-    // are forwarded to every subsequent request (WebSocket upgrade, SSE GET,
-    // long-polling GET/POST/DELETE) - all of which share this dispatcher.
-    const effectiveDispatcher: Dispatcher | null =
-      this.#cookieJar !== null
-        ? new CookieAgent({ cookies: { jar: this.#cookieJar } })
-        : this.#dispatcher;
+    // If withCookies() was called, the connection uses a CookieAgent as its
+    // dispatcher so that Set-Cookie headers from /negotiate are stored and
+    // Cookie headers are forwarded to every subsequent request (WebSocket
+    // upgrade, SSE GET, long-polling GET/POST/DELETE) - all of which share it.
+    const jar = this.#cookieJar;
+    if (jar !== null && this.#httpClient !== null) {
+      this.#logger?.log(
+        LogLevel.Warning,
+        'withCookies() does not reach a client from withHttpClient(): negotiate and ' +
+        'HTTP transport requests will not use the cookie jar.',
+      );
+    }
 
     // exactOptionalPropertyTypes: spread only defined values so we never
     // explicitly assign `undefined` to an optional property.
@@ -302,10 +306,10 @@ export class HubConnectionBuilder {
       ...(this.#urlOptions.handshakeTimeoutInMilliseconds  != null && { handshakeTimeoutInMilliseconds:  this.#urlOptions.handshakeTimeoutInMilliseconds }),
       ...(this.#urlOptions.maximumReceiveMessageSize       != null && { maximumReceiveMessageSize:       this.#urlOptions.maximumReceiveMessageSize }),
       ...(this.#reconnectPolicy    != null && { reconnectPolicy: this.#reconnectPolicy }),
-      ...(effectiveDispatcher      != null && { dispatcher:      effectiveDispatcher  }),
+      ...(this.#dispatcher         != null && { dispatcher:      this.#dispatcher     }),
       ...(this.#httpClient         != null && { httpClient:      this.#httpClient     }),
       ...(this.#protocol           != null && { protocol:        this.#protocol       }),
-      ...(this.#cookieJar          != null && { ownsDispatcher:  true                 }),
+      ...(jar                      != null && { dispatcherFactory: () => new CookieAgent({ cookies: { jar } }) }),
     };
 
     return new HubConnection(this.#url, options);

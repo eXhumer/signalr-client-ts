@@ -15,6 +15,8 @@ import type { IHttpClient } from '../interfaces.js';
 import { TransferFormat, LogLevel } from '../constants.js';
 import type { ITransport, ILogger } from '../interfaces.js';
 
+const DEFAULT_MAXIMUM_MESSAGE_SIZE = 32 * 1024 * 1024;
+
 export class ServerSentEventsTransport implements ITransport {
   readonly name = 'ServerSentEvents' as const;
 
@@ -22,10 +24,14 @@ export class ServerSentEventsTransport implements ITransport {
   readonly #accessTokenFactory:  (() => Promise<string | null>) | null;
   readonly #logger:              ILogger;
   readonly #extraHeaders:        Record<string, string>;
+  readonly #maximumMessageSize:  number;
 
   #url:       string | null             = null;
   #abort:     (() => void) | null       = null;  // replaces the old ClientRequest handle
   #sseBuffer: string                    = '';
+  #closed:    boolean                   = false;
+  /** Keeps POSTs in the order they were sent. */
+  #sendQueue: Promise<unknown>          = Promise.resolve();
 
   onreceive: ((data: string | Uint8Array) => void) | null = null;
   onclose:   ((error?: Error) => void)             | null = null;
@@ -35,11 +41,13 @@ export class ServerSentEventsTransport implements ITransport {
     accessTokenFactory:  (() => Promise<string | null>) | null,
     logger:              ILogger,
     extraHeaders:        Record<string, string> = {},
+    maximumMessageSize:  number = DEFAULT_MAXIMUM_MESSAGE_SIZE,
   ) {
     this.#httpClient         = httpClient;
     this.#accessTokenFactory = accessTokenFactory;
     this.#logger             = logger;
     this.#extraHeaders       = extraHeaders;
+    this.#maximumMessageSize = maximumMessageSize;
   }
 
   async connect(url: string, transferFormat: TransferFormat): Promise<void> {
@@ -81,19 +89,23 @@ export class ServerSentEventsTransport implements ITransport {
     result.body.on('data', (chunk: string) => this.#onData(chunk));
     result.body.on('end',  () => {
       this.#logger.log(LogLevel.Information, '(SSE transport) EventSource closed.');
-      this.#abort = null;
-      this.onclose?.();
+      this.#close();
     });
     result.body.on('error', (err: Error) => {
       this.#logger.log(LogLevel.Error, `(SSE transport) Stream error: ${err.message}`);
-      this.#abort = null;
-      this.onclose?.(err);
+      this.#close(err);
     });
 
     this.#logger.log(LogLevel.Information, '(SSE transport) Connected.');
   }
 
-  async send(data: string | Uint8Array): Promise<void> {
+  send(data: string | Uint8Array): Promise<void> {
+    const sending = this.#sendQueue.then(() => this.#post(data));
+    this.#sendQueue = sending.catch(() => {});
+    return sending;
+  }
+
+  async #post(data: string | Uint8Array): Promise<void> {
     if (!this.#url) throw new Error('SSE transport is not connected.');
 
     const headers: Record<string, string> = {
@@ -123,10 +135,25 @@ export class ServerSentEventsTransport implements ITransport {
     return Promise.resolve();
   }
 
+  /** Report the end of the stream once, however it ended. */
+  #close(err?: Error): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#abort = null;
+    this.onclose?.(err);
+  }
+
   // ─── SSE parser ───────────────────────────────────────────────────────────
 
   #onData(chunk: string): void {
     this.#sseBuffer += chunk;
+
+    if (this.#sseBuffer.length > this.#maximumMessageSize) {
+      const abort = this.#abort;
+      this.#close(new Error(`Server-Sent Event exceeds ${this.#maximumMessageSize} characters.`));
+      abort?.();
+      return;
+    }
 
     let boundary: number;
     while ((boundary = findEventBoundary(this.#sseBuffer)) !== -1) {
